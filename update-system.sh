@@ -7,21 +7,39 @@
 set -Eeuo pipefail
 
 # =========================================================
-# KONFIGURATION
+# KONFIGURATION & PARAMETER
 # =========================================================
 
-# Setze auf "true", wenn ungenutzte Abhängigkeiten automatisch 
-# durch 'dnf autoremove' entfernt werden sollen. 
-# (Tipp: Unter Fedora mit Vorsicht genießen, daher Standard = false)
 RUN_AUTOREMOVE="false"
-
-# Setze auf "true", wenn Snap-Pakete aktualisiert werden sollen.
-# (Snap ist unter Fedora standardmäßig nicht installiert)
 RUN_SNAP_UPDATE="false"
+LOGFILE=""
+
+# Kommandozeilen-Parameter auswerten
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        --autoremove) RUN_AUTOREMOVE="true" ;;
+        --snap) RUN_SNAP_UPDATE="true" ;;
+        --log)
+            LOGFILE="$2"
+            shift
+            ;;
+        *)
+            printf '❌ Unbekannter Parameter: %s\n' "$1" >&2
+            exit 1
+            ;;
+    esac
+    shift
+done
 
 # =========================================================
 # FUNKTIONEN & INITIALISIERUNG
 # =========================================================
+
+# Logging einrichten, falls Parameter übergeben wurde
+if [[ -n "$LOGFILE" ]]; then
+    # Leitet stdout und stderr in die Logdatei UND auf das Terminal um
+    exec > >(tee -a "$LOGFILE") 2>&1
+fi
 
 # Farben und NO_COLOR Unterstützung
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
@@ -43,21 +61,6 @@ info()    { printf '%b▶ %s%b\n' "$BLUE" "$*" "$RESET"; }
 success() { printf '%b✔ %s%b\n' "$GREEN" "$*" "$RESET"; }
 warning() { printf '%b⚠ %s%b\n' "$YELLOW" "$*" "$RESET"; }
 error()   { printf '%b❌ %s%b\n' "$RED" "$*" "$RESET" >&2; }
-
-# Validierung der Konfigurationsvariablen
-validate_boolean() {
-    local name=$1
-    local value=$2
-    case "$value" in
-        true|false) ;;
-        *) 
-            error "Ungültiger Wert für $name: $value – erlaubt sind true oder false."
-            exit 2 
-            ;;
-    esac
-}
-validate_boolean "RUN_AUTOREMOVE" "$RUN_AUTOREMOVE"
-validate_boolean "RUN_SNAP_UPDATE" "$RUN_SNAP_UPDATE"
 
 # Betriebssystem-Prüfung
 if [[ ! -r /etc/fedora-release ]]; then
@@ -98,6 +101,8 @@ trap cleanup EXIT
 UPDATE_WARNINGS=()
 
 info "Start: $(date '+%d.%m.%Y %H:%M:%S')"
+[[ -n "$LOGFILE" ]] && info "Logging in Datei aktiv: $LOGFILE"
+
 info "Fordere Administratorrechte an..."
 sudo -v
 
@@ -114,7 +119,7 @@ if [[ "$RUN_AUTOREMOVE" == "true" ]]; then
     info "Führe DNF Autoremove aus..."
     sudo dnf autoremove -y
 else
-    info "DNF 'autoremove' ist in der Konfiguration deaktiviert. Übersprungen."
+    info "DNF 'autoremove' ist nicht aktiviert (nutze --autoremove). Übersprungen."
 fi
 
 printf '\n'
@@ -145,7 +150,7 @@ if [[ "$RUN_SNAP_UPDATE" == "true" ]]; then
         info "Snap ist nicht installiert. Übersprungen."
     fi
 else
-    info "Snap-Updates sind in der Konfiguration deaktiviert. Übersprungen."
+    info "Snap-Updates sind nicht aktiviert (nutze --snap). Übersprungen."
 fi
 
 printf '\n'
@@ -174,7 +179,7 @@ else
         REBOOT_COLOR="$YELLOW"
         REBOOT_ICON="⚠"
     else
-        REBOOT_MSG="Neustartstatus konnte nicht zuverlässig ermittelt werden."
+        REBOOT_MSG="Neustartstatus unklar (Fehlt evtl. das Plugin 'python3-dnf-plugins-core'?)"
         REBOOT_COLOR="$RED"
         REBOOT_ICON="❓"
         warning "DNF-Prüfung fehlgeschlagen (Code $NEEDS_RESTART_RC): $NEEDS_RESTART_OUTPUT"
@@ -187,7 +192,6 @@ if [[ ${#UPDATE_WARNINGS[@]} -eq 0 ]]; then
     success "Alle vorgesehenen Update-Schritte wurden ohne Fehler ausgeführt. ($(date '+%H:%M:%S'))"
     NOTIFY_MSG="Alle vorgesehenen Update-Schritte wurden ohne Fehler ausgeführt."
 else
-    # Zeigt Warnungen im Abschluss an, falls optionale Paketmanager zickten
     warning "Update mit Teilfehlern abgeschlossen (${UPDATE_WARNINGS[*]}). Bitte Terminalausgabe prüfen. ($(date '+%H:%M:%S'))"
     NOTIFY_MSG="Update abgeschlossen, aber mit Warnungen bei: ${UPDATE_WARNINGS[*]}. Bitte Terminal prüfen."
 fi
