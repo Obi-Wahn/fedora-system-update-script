@@ -27,7 +27,9 @@ Optionen:
   --snap           Aktiviert Snap-Updates (falls installiert und aktiv).
   --log <Datei>    Schreibt die komplette Ausgabe zusätzlich in <Datei>.
   --dry-run        Zeigt nur an, welche Befehle ausgeführt würden, ohne
-                   Änderungen am System vorzunehmen.
+                   Änderungen am System vorzunehmen. Es werden dabei keine
+                   Administratorrechte angefordert; der detaillierte
+                   Neustart-Check am Ende entfällt daher.
   -h, --help       Zeigt diese Hilfe an und beendet das Skript.
 EOF
 }
@@ -92,6 +94,22 @@ run_step() {
     "$@"
 }
 
+# Betriebssystem-Prüfung
+if [[ ! -r /etc/fedora-release ]]; then
+    error "Dieses Skript ist ausschließlich für Fedora vorgesehen."
+    exit 1
+fi
+
+# Abhängigkeiten prüfen
+required_commands=(sudo dnf rpm uname sort date)
+[[ -n "$LOGFILE" ]] && required_commands+=(tee)
+for cmd in "${required_commands[@]}"; do
+    if ! command -v "$cmd" &>/dev/null; then
+        error "Erforderlicher Befehl fehlt: $cmd"
+        exit 127
+    fi
+done
+
 # Logging einrichten, falls Parameter übergeben wurde
 if [[ -n "$LOGFILE" ]]; then
     if ! touch "$LOGFILE" 2>/dev/null; then
@@ -101,21 +119,6 @@ if [[ -n "$LOGFILE" ]]; then
     # Leitet stdout und stderr in die Logdatei UND auf das Terminal um
     exec > >(tee -a "$LOGFILE") 2>&1
 fi
-
-# Betriebssystem-Prüfung
-if [[ ! -r /etc/fedora-release ]]; then
-    error "Dieses Skript ist ausschließlich für Fedora vorgesehen."
-    exit 1
-fi
-
-# Abhängigkeiten prüfen
-required_commands=(sudo dnf rpm uname sort date)
-for cmd in "${required_commands[@]}"; do
-    if ! command -v "$cmd" &>/dev/null; then
-        error "Erforderlicher Befehl fehlt: $cmd"
-        exit 127
-    fi
-done
 
 # Root-Check
 if [[ "${EUID:-}" -eq 0 ]]; then
@@ -144,12 +147,16 @@ info "Start: $(date '+%d.%m.%Y %H:%M:%S')"
 [[ -n "$LOGFILE" ]] && info "Logging in Datei aktiv: $LOGFILE"
 [[ "$DRY_RUN" == "true" ]] && warning "Dry-Run-Modus aktiv: Es werden keine Änderungen am System vorgenommen."
 
-info "Fordere Administratorrechte an..."
-sudo -v
+if [[ "$DRY_RUN" == "true" ]]; then
+    info "Fordere keine Administratorrechte an (Dry-Run-Modus)."
+else
+    info "Fordere Administratorrechte an..."
+    sudo -v
 
-# Sudo-Ticket im Hintergrund alle 50s erneuern
-( while kill -0 $$ 2>/dev/null; do sudo -n -v 2>/dev/null || true; sleep 50; done ) &
-SUDO_KEEPALIVE_PID=$!
+    # Sudo-Ticket im Hintergrund alle 50s erneuern
+    ( while kill -0 $$ 2>/dev/null; do sudo -n -v 2>/dev/null || true; sleep 50; done ) &
+    SUDO_KEEPALIVE_PID=$!
+fi
 
 printf '\n'
 info "Starte System-Updates via DNF..."
@@ -209,6 +216,10 @@ if [[ -n "$LATEST_KERNEL" && "$CURRENT_KERNEL" != "$LATEST_KERNEL" ]]; then
     REBOOT_MSG="System-Neustart empfohlen (Neuer Kernel installiert)."
     REBOOT_COLOR="$YELLOW"
     REBOOT_ICON="⚠"
+elif [[ "$DRY_RUN" == "true" ]]; then
+    REBOOT_MSG="Genauer Neustart-Status im Dry-Run nicht geprüft (erfordert Root-Rechte)."
+    REBOOT_COLOR="$BLUE"
+    REBOOT_ICON="ℹ"
 elif NEEDS_RESTART_OUTPUT=$(sudo dnf needs-restarting -r 2>&1); then
     REBOOT_MSG="Kein Neustart erforderlich."
     REBOOT_COLOR="$GREEN"

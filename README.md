@@ -35,7 +35,7 @@ Das Skript wird nun primär über Kommandozeilen-Parameter beim Aufruf gesteuert
 > * **\--autoremove**: Führt nach dem DNF-Upgrade automatisch ein *dnf autoremove* aus, um ungenutzte Abhängigkeiten zu entfernen.  
 > * **\--snap**: Aktiviert die Aktualisierung von Snap-Paketen (standardmäßig übersprungen, da Snap unter Fedora nicht vorinstalliert ist).  
 > * **\--log \<Dateipfad\>**: Speichert die gesamte Terminalausgabe (inkl. Fehler) zusätzlich in der angegebenen Logdatei.  
-> * **\--dry-run**: Zeigt nur an, welche Befehle ausgeführt würden (DNF-Upgrade, Autoremove, Flatpak, Snap), ohne Änderungen am System vorzunehmen.  
+> * **\--dry-run**: Zeigt nur an, welche Befehle ausgeführt würden (DNF-Upgrade, Autoremove, Flatpak, Snap), ohne Änderungen am System vorzunehmen. Es werden dabei keine Administratorrechte angefordert; der detaillierte Neustart-Check am Ende entfällt daher (eine bereits erkennbare neue Kernel-Version wird weiterhin angezeigt).  
 > * **\-h, \--help**: Zeigt eine Übersicht aller Parameter an und beendet das Skript.
 
 ## **💻 Nutzung**
