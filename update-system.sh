@@ -20,6 +20,10 @@ while [[ "$#" -gt 0 ]]; do
         --autoremove) RUN_AUTOREMOVE="true" ;;
         --snap) RUN_SNAP_UPDATE="true" ;;
         --log)
+            if [[ "$#" -lt 2 ]]; then
+                printf '❌ Fehlendes Argument für --log <Dateipfad>\n' >&2
+                exit 1
+            fi
             LOGFILE="$2"
             shift
             ;;
@@ -34,12 +38,6 @@ done
 # =========================================================
 # FUNKTIONEN & INITIALISIERUNG
 # =========================================================
-
-# Logging einrichten, falls Parameter übergeben wurde
-if [[ -n "$LOGFILE" ]]; then
-    # Leitet stdout und stderr in die Logdatei UND auf das Terminal um
-    exec > >(tee -a "$LOGFILE") 2>&1
-fi
 
 # Farben und NO_COLOR Unterstützung
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
@@ -61,6 +59,16 @@ info()    { printf '%b▶ %s%b\n' "$BLUE" "$*" "$RESET"; }
 success() { printf '%b✔ %s%b\n' "$GREEN" "$*" "$RESET"; }
 warning() { printf '%b⚠ %s%b\n' "$YELLOW" "$*" "$RESET"; }
 error()   { printf '%b❌ %s%b\n' "$RED" "$*" "$RESET" >&2; }
+
+# Logging einrichten, falls Parameter übergeben wurde
+if [[ -n "$LOGFILE" ]]; then
+    if ! touch "$LOGFILE" 2>/dev/null; then
+        error "Kann nicht in Logdatei schreiben: $LOGFILE"
+        exit 1
+    fi
+    # Leitet stdout und stderr in die Logdatei UND auf das Terminal um
+    exec > >(tee -a "$LOGFILE") 2>&1
+fi
 
 # Betriebssystem-Prüfung
 if [[ ! -r /etc/fedora-release ]]; then
@@ -84,7 +92,7 @@ if [[ "${EUID:-}" -eq 0 ]]; then
 fi
 
 # Traps für Fehler und sauberes Beenden
-trap 'err_code=$?; error "Fehler in Zeile $LINENO (Code $err_code): $BASH_COMMAND\nUpdate abgebrochen."; exit $err_code' ERR
+trap 'err_code=$?; error "Fehler in Zeile $LINENO (Code $err_code): $BASH_COMMAND"; error "Update abgebrochen."; exit $err_code' ERR
 
 cleanup() {
     if [[ -n "${SUDO_KEEPALIVE_PID:-}" ]]; then
