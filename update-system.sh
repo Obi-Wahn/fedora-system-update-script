@@ -12,13 +12,36 @@ set -Eeuo pipefail
 
 RUN_AUTOREMOVE="false"
 RUN_SNAP_UPDATE="false"
+DRY_RUN="false"
 LOGFILE=""
+
+print_usage() {
+    cat <<'EOF'
+Verwendung: update-system.sh [OPTIONEN]
+
+Aktualisiert ein Fedora-System (DNF, Flatpak, optional Snap) in einem
+abgesicherten Durchlauf.
+
+Optionen:
+  --autoremove     Führt nach dem DNF-Upgrade 'dnf autoremove' aus.
+  --snap           Aktiviert Snap-Updates (falls installiert und aktiv).
+  --log <Datei>    Schreibt die komplette Ausgabe zusätzlich in <Datei>.
+  --dry-run        Zeigt nur an, welche Befehle ausgeführt würden, ohne
+                   Änderungen am System vorzunehmen.
+  -h, --help       Zeigt diese Hilfe an und beendet das Skript.
+EOF
+}
 
 # Kommandozeilen-Parameter auswerten
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         --autoremove) RUN_AUTOREMOVE="true" ;;
         --snap) RUN_SNAP_UPDATE="true" ;;
+        --dry-run) DRY_RUN="true" ;;
+        -h|--help)
+            print_usage
+            exit 0
+            ;;
         --log)
             if [[ "$#" -lt 2 ]]; then
                 printf '❌ Fehlendes Argument für --log <Dateipfad>\n' >&2
@@ -59,6 +82,15 @@ info()    { printf '%b▶ %s%b\n' "$BLUE" "$*" "$RESET"; }
 success() { printf '%b✔ %s%b\n' "$GREEN" "$*" "$RESET"; }
 warning() { printf '%b⚠ %s%b\n' "$YELLOW" "$*" "$RESET"; }
 error()   { printf '%b❌ %s%b\n' "$RED" "$*" "$RESET" >&2; }
+
+# Führt einen Befehl aus, oder zeigt ihn im Dry-Run-Modus nur an
+run_step() {
+    if [[ "$DRY_RUN" == "true" ]]; then
+        info "[DRY-RUN] Würde ausführen: $*"
+        return 0
+    fi
+    "$@"
+}
 
 # Logging einrichten, falls Parameter übergeben wurde
 if [[ -n "$LOGFILE" ]]; then
@@ -110,6 +142,7 @@ UPDATE_WARNINGS=()
 
 info "Start: $(date '+%d.%m.%Y %H:%M:%S')"
 [[ -n "$LOGFILE" ]] && info "Logging in Datei aktiv: $LOGFILE"
+[[ "$DRY_RUN" == "true" ]] && warning "Dry-Run-Modus aktiv: Es werden keine Änderungen am System vorgenommen."
 
 info "Fordere Administratorrechte an..."
 sudo -v
@@ -120,12 +153,12 @@ SUDO_KEEPALIVE_PID=$!
 
 printf '\n'
 info "Starte System-Updates via DNF..."
-sudo dnf upgrade --refresh -y
+run_step sudo dnf upgrade --refresh -y
 
 if [[ "$RUN_AUTOREMOVE" == "true" ]]; then
     printf '\n'
     info "Führe DNF Autoremove aus..."
-    sudo dnf autoremove -y
+    run_step sudo dnf autoremove -y
 else
     info "DNF 'autoremove' ist nicht aktiviert (nutze --autoremove). Übersprungen."
 fi
@@ -134,7 +167,7 @@ printf '\n'
 info "Starte Flatpak-Updates..."
 if command -v flatpak &>/dev/null; then
     # Das '||' verhindert, dass set -e das Skript bei temporären Flatpak-Fehlern beendet
-    flatpak update -y || {
+    run_step flatpak update -y || {
         warning "Flatpak-Update meldete einen Fehler (z.B. Repo unerreichbar)."
         UPDATE_WARNINGS+=("Flatpak")
     }
@@ -147,7 +180,7 @@ if [[ "$RUN_SNAP_UPDATE" == "true" ]]; then
     info "Starte Snap-Updates..."
     if command -v snap &>/dev/null; then
         if systemctl is-active --quiet snapd.service || systemctl is-active --quiet snapd.socket; then
-            sudo snap refresh || {
+            run_step sudo snap refresh || {
                 warning "Snap-Update meldete einen Fehler."
                 UPDATE_WARNINGS+=("Snap")
             }
@@ -206,7 +239,7 @@ fi
 
 printf '%b%s %s%b\n' "$REBOOT_COLOR" "$REBOOT_ICON" "$REBOOT_MSG" "$RESET"
 
-# Desktop-Benachrichtigung senden
-if command -v notify-send &>/dev/null; then
+# Desktop-Benachrichtigung senden (nur mit aktiver Desktop-Session, z.B. nicht über SSH)
+if command -v notify-send &>/dev/null && [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
     notify-send "System-Update abgeschlossen" "$(printf "%s\n%s" "$NOTIFY_MSG" "$REBOOT_MSG")" -i system-software-update || true
 fi

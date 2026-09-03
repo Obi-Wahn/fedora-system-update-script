@@ -34,7 +34,9 @@ Das Skript wird nun primär über Kommandozeilen-Parameter beim Aufruf gesteuert
 
 > * **\--autoremove**: Führt nach dem DNF-Upgrade automatisch ein *dnf autoremove* aus, um ungenutzte Abhängigkeiten zu entfernen.  
 > * **\--snap**: Aktiviert die Aktualisierung von Snap-Paketen (standardmäßig übersprungen, da Snap unter Fedora nicht vorinstalliert ist).  
-> * **\--log \<Dateipfad\>**: Speichert die gesamte Terminalausgabe (inkl. Fehler) zusätzlich in der angegebenen Logdatei.
+> * **\--log \<Dateipfad\>**: Speichert die gesamte Terminalausgabe (inkl. Fehler) zusätzlich in der angegebenen Logdatei.  
+> * **\--dry-run**: Zeigt nur an, welche Befehle ausgeführt würden (DNF-Upgrade, Autoremove, Flatpak, Snap), ohne Änderungen am System vorzunehmen.  
+> * **\-h, \--help**: Zeigt eine Übersicht aller Parameter an und beendet das Skript.
 
 ## **💻 Nutzung**
 
@@ -46,11 +48,20 @@ Aufruf mit allen Optionen (Autoremove, Snap-Updates und Logging):
 
 ./update-system.sh \--autoremove \--snap \--log mein-update.log
 
+Testlauf ohne Änderungen am System (zeigt nur an, was ausgeführt würde):
+
+./update-system.sh \--dry-run
+
 Wenn das Skript nach \~/.local/bin verschoben wurde, genügt der systemweite Aufruf:
 
 update-system \--autoremove
 
 Beim Start wird einmalig das Sudo-Passwort abgefragt. Danach läuft das Skript vollautomatisch durch.
+
+## **⚠️ Bekannte Einschränkungen**
+
+> * **dnf5 (Fedora 41+):** Fedora 41 hat den Befehl `dnf` standardmäßig durch `dnf5` ersetzt (der Aufruf `dnf` bleibt als Alias erhalten). Die im Skript verwendete Neustart-Prüfung (`dnf needs-restarting -r`) sollte auch unter dnf5 kompatibel sein, wurde für dieses Skript aber nicht auf einem echten dnf5-System verifiziert.  
+> * **Desktop-Benachrichtigungen:** `notify-send` wird nur aufgerufen, wenn eine aktive Desktop-Session erkannt wird (`DBUS_SESSION_BUS_ADDRESS` gesetzt). Bei einer reinen SSH-Sitzung ohne grafische Session wird die Benachrichtigung übersprungen.
 
 ## **🤖 Hinweis zur Erstellung**
 
