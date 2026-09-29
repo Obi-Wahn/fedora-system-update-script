@@ -7,58 +7,13 @@
 set -Eeuo pipefail
 
 # =========================================================
-# KONFIGURATION & PARAMETER
+# KONFIGURATION
 # =========================================================
 
 RUN_AUTOREMOVE="false"
 RUN_SNAP_UPDATE="false"
 DRY_RUN="false"
 LOGFILE=""
-
-print_usage() {
-    cat <<'EOF'
-Verwendung: update-system.sh [OPTIONEN]
-
-Aktualisiert ein Fedora-System (DNF, Flatpak, optional Snap) in einem
-abgesicherten Durchlauf.
-
-Optionen:
-  --autoremove     Führt nach dem DNF-Upgrade 'dnf autoremove' aus.
-  --snap           Aktiviert Snap-Updates (falls installiert und aktiv).
-  --log <Datei>    Schreibt die komplette Ausgabe zusätzlich in <Datei>.
-  --dry-run        Zeigt nur an, welche Befehle ausgeführt würden, ohne
-                   Änderungen am System vorzunehmen. Es werden dabei keine
-                   Administratorrechte angefordert; der detaillierte
-                   Neustart-Check am Ende entfällt daher.
-  -h, --help       Zeigt diese Hilfe an und beendet das Skript.
-EOF
-}
-
-# Kommandozeilen-Parameter auswerten
-while [[ "$#" -gt 0 ]]; do
-    case $1 in
-        --autoremove) RUN_AUTOREMOVE="true" ;;
-        --snap) RUN_SNAP_UPDATE="true" ;;
-        --dry-run) DRY_RUN="true" ;;
-        -h|--help)
-            print_usage
-            exit 0
-            ;;
-        --log)
-            if [[ "$#" -lt 2 ]]; then
-                printf '❌ Fehlendes Argument für --log <Dateipfad>\n' >&2
-                exit 1
-            fi
-            LOGFILE="$2"
-            shift
-            ;;
-        *)
-            printf '❌ Unbekannter Parameter: %s\n' "$1" >&2
-            exit 1
-            ;;
-    esac
-    shift
-done
 
 # =========================================================
 # FUNKTIONEN & INITIALISIERUNG
@@ -94,9 +49,78 @@ run_step() {
     "$@"
 }
 
+print_usage() {
+    cat <<EOF
+Verwendung: ${0##*/} [OPTIONEN]
+
+Aktualisiert ein Fedora-System (DNF, Flatpak, optional Snap) in einem
+abgesicherten Durchlauf.
+
+Optionen:
+  --autoremove     Führt nach dem DNF-Upgrade 'dnf autoremove' aus.
+  --snap           Aktiviert Snap-Updates (falls installiert und aktiv).
+  --log <Datei>    Schreibt die komplette Ausgabe zusätzlich in <Datei>
+                   (Farben werden dabei deaktiviert).
+  --dry-run        Zeigt nur an, welche Befehle ausgeführt würden, ohne
+                   Änderungen am System vorzunehmen. Es werden dabei keine
+                   Administratorrechte angefordert; der detaillierte
+                   Neustart-Check am Ende entfällt daher.
+  -h, --help       Zeigt diese Hilfe an und beendet das Skript.
+
+Exit-Codes:
+  0                Alle Schritte erfolgreich (bzw. Dry-Run abgeschlossen).
+  1                Ungültiger Aufruf oder Teilfehler (Flatpak/Snap).
+  sonstige         Abbruch durch einen fehlgeschlagenen Befehl.
+EOF
+}
+
+# =========================================================
+# KOMMANDOZEILEN-PARAMETER
+# =========================================================
+
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        --autoremove) RUN_AUTOREMOVE="true" ;;
+        --snap) RUN_SNAP_UPDATE="true" ;;
+        --dry-run) DRY_RUN="true" ;;
+        -h|--help)
+            print_usage
+            exit 0
+            ;;
+        --log)
+            if [[ "$#" -lt 2 ]]; then
+                error "Fehlendes Argument für --log <Dateipfad>"
+                exit 1
+            fi
+            LOGFILE="$2"
+            shift
+            ;;
+        *)
+            error "Unbekannter Parameter: $1 (Hilfe mit --help)"
+            exit 1
+            ;;
+    esac
+    shift
+done
+
+# Keine ANSI-Farbcodes in die Logdatei schreiben
+if [[ -n "$LOGFILE" ]]; then
+    GREEN="" BLUE="" YELLOW="" RED="" RESET=""
+fi
+
+# =========================================================
+# SYSTEMPRÜFUNGEN
+# =========================================================
+
 # Betriebssystem-Prüfung
 if [[ ! -r /etc/fedora-release ]]; then
     error "Dieses Skript ist ausschließlich für Fedora vorgesehen."
+    exit 1
+fi
+
+# Root-Check (vor dem Logging, damit keine root-eigene Logdatei entsteht)
+if [[ "${EUID:-}" -eq 0 ]]; then
+    error "Bitte das Skript NICHT als Root (mit sudo) starten! Das Skript fordert die Rechte selbst an."
     exit 1
 fi
 
@@ -120,15 +144,10 @@ if [[ -n "$LOGFILE" ]]; then
     exec > >(tee -a "$LOGFILE") 2>&1
 fi
 
-# Root-Check
-if [[ "${EUID:-}" -eq 0 ]]; then
-    error "Bitte das Skript NICHT als Root (mit sudo) starten! Das Skript fordert die Rechte selbst an."
-    exit 1
-fi
-
 # Traps für Fehler und sauberes Beenden
 trap 'err_code=$?; error "Fehler in Zeile $LINENO (Code $err_code): $BASH_COMMAND"; error "Update abgebrochen."; exit $err_code' ERR
 
+# shellcheck disable=SC2317  # wird indirekt über 'trap cleanup EXIT' aufgerufen
 cleanup() {
     if [[ -n "${SUDO_KEEPALIVE_PID:-}" ]]; then
         kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
@@ -179,7 +198,7 @@ if command -v flatpak &>/dev/null; then
         UPDATE_WARNINGS+=("Flatpak")
     }
 else
-    warning "Flatpak nicht installiert, übersprungen."
+    info "Flatpak ist nicht installiert. Übersprungen."
 fi
 
 printf '\n'
@@ -231,7 +250,7 @@ else
         REBOOT_COLOR="$YELLOW"
         REBOOT_ICON="⚠"
     else
-        REBOOT_MSG="Neustartstatus unklar (Fehlt evtl. das Plugin 'python3-dnf-plugins-core'?)"
+        REBOOT_MSG="Neustartstatus unklar (fehlt evtl. das needs-restarting-Plugin: 'dnf5-plugins' bzw. bei dnf4 'python3-dnf-plugins-core'?)"
         REBOOT_COLOR="$RED"
         REBOOT_ICON="❓"
         warning "DNF-Prüfung fehlgeschlagen (Code $NEEDS_RESTART_RC): $NEEDS_RESTART_OUTPUT"
@@ -240,17 +259,23 @@ fi
 
 # Finale Ausgabe im Terminal
 printf '\n'
-if [[ ${#UPDATE_WARNINGS[@]} -eq 0 ]]; then
+EXIT_CODE=0
+if [[ "$DRY_RUN" == "true" ]]; then
+    success "Dry-Run abgeschlossen. Es wurden keine Änderungen am System vorgenommen. ($(date '+%H:%M:%S'))"
+elif [[ ${#UPDATE_WARNINGS[@]} -eq 0 ]]; then
     success "Alle vorgesehenen Update-Schritte wurden ohne Fehler ausgeführt. ($(date '+%H:%M:%S'))"
     NOTIFY_MSG="Alle vorgesehenen Update-Schritte wurden ohne Fehler ausgeführt."
 else
     warning "Update mit Teilfehlern abgeschlossen (${UPDATE_WARNINGS[*]}). Bitte Terminalausgabe prüfen. ($(date '+%H:%M:%S'))"
     NOTIFY_MSG="Update abgeschlossen, aber mit Warnungen bei: ${UPDATE_WARNINGS[*]}. Bitte Terminal prüfen."
+    EXIT_CODE=1
 fi
 
 printf '%b%s %s%b\n' "$REBOOT_COLOR" "$REBOOT_ICON" "$REBOOT_MSG" "$RESET"
 
-# Desktop-Benachrichtigung senden (nur mit aktiver Desktop-Session, z.B. nicht über SSH)
-if command -v notify-send &>/dev/null && [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+# Desktop-Benachrichtigung senden (nicht im Dry-Run und nur mit aktiver Desktop-Session, z.B. nicht über SSH)
+if [[ "$DRY_RUN" != "true" ]] && command -v notify-send &>/dev/null && [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
     notify-send "System-Update abgeschlossen" "$(printf "%s\n%s" "$NOTIFY_MSG" "$REBOOT_MSG")" -i system-software-update || true
 fi
+
+exit "$EXIT_CODE"
