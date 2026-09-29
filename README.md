@@ -1,72 +1,101 @@
-# **Fedora System Update Script**
+# Fedora System Update Script
 
-Ein robustes und automatisiertes Bash-Skript, um Fedora Linux effizient auf dem neuesten Stand zu halten. Das Skript aktualisiert sowohl die regulären Systempakete (via DNF) als auch isolierte Anwendungen (via Flatpak und Snap) in einem einzigen, abgesicherten Durchlauf.
+Ein robustes und automatisiertes Bash-Skript, um Fedora Linux effizient auf dem neuesten Stand zu halten. Das Skript aktualisiert sowohl die regulären Systempakete (via DNF) als auch isolierte Anwendungen (via Flatpak und optional Snap) in einem einzigen, abgesicherten Durchlauf.
 
-## **🚀 Funktionen**
+## 🚀 Funktionen
 
-> * **Umfassendes Update:** Aktualisiert DNF-Pakete, Flatpak- und Snap-Anwendungen nacheinander.  
-> * **Flexible Parameter:** Über Kommandozeilen-Parameter lassen sich optionale Schritte wie *dnf autoremove*, *Snap-Updates* und das *Logging* flexibel aktivieren.  
-> * **Zentrales Logging:** Optionale Umleitung aller Ausgaben und Fehlermeldungen in eine definierte Logdatei.  
-> * **Strikte Fehlerbehandlung:** Nutzt *set \-Eeuo pipefail* und einen ERR-Trap, um bei Problemen sofort und mit genauer Fehlerzeile abbrechen zu können.  
-> * **Sudo-Keepalive:** Verhindert das Ablaufen des Sudo-Tickets bei großen Updates (z. B. umfangreichen Flatpak-Runtimes), sodass keine zweite Passworteingabe während des Vorgangs nötig ist.  
-> * **Defensive Programmierung:** Prüft automatisch auf das Vorhandensein optionaler Komponenten (Flatpak, Snap, libnotify). Bei Snap wird zusätzlich validiert, ob der Systemd-Hintergrunddienst (snapd) aktiv ist. Fehlende Komponenten werden ohne Störmeldung übersprungen.  
-> * **Neustart-Prüfung:** Ermittelt zuverlässig, ob nach dem Update ein Systemneustart empfohlen wird (z. B. nach einem Kernel-Update oder bei Kern-Bibliotheken). Warnt explizit bei fehlenden DNF-Plugins.  
-> * **Desktop-Benachrichtigungen:** Sendet nach dem erfolgreichen Durchlauf eine native, sachlich korrekte Systembenachrichtigung (ideal für KDE Plasma oder GNOME).
+* **Umfassendes Update:** Aktualisiert DNF-Pakete, Flatpak- und (optional) Snap-Anwendungen nacheinander.
+* **Flexible Parameter:** Über Kommandozeilen-Parameter lassen sich optionale Schritte wie *dnf autoremove*, *Snap-Updates* und das *Logging* aktivieren.
+* **Testlauf (Dry-Run):** Zeigt an, welche Befehle ausgeführt würden, ohne Änderungen am System vorzunehmen und ohne Administratorrechte anzufordern.
+* **Integrierte Hilfe:** `--help` listet alle Parameter und Exit-Codes auf.
+* **Zentrales Logging:** Optionale Umleitung aller Ausgaben und Fehlermeldungen in eine Logdatei (ohne Farbcodes).
+* **Strikte Fehlerbehandlung:** Nutzt `set -Eeuo pipefail` und einen ERR-Trap, um bei Problemen sofort und mit genauer Fehlerzeile abzubrechen.
+* **Sudo-Keepalive:** Verhindert das Ablaufen des Sudo-Tickets bei langen Updates, sodass keine zweite Passworteingabe während des Vorgangs nötig ist.
+* **Defensive Programmierung:** Prüft automatisch auf das Vorhandensein optionaler Komponenten (Flatpak, Snap, libnotify). Bei Snap wird zusätzlich geprüft, ob der Systemd-Dienst (snapd) aktiv ist. Fehlende Komponenten werden mit einem kurzen Hinweis übersprungen.
+* **Neustart-Prüfung:** Ermittelt, ob nach dem Update ein Systemneustart empfohlen wird (z. B. nach einem Kernel-Update oder bei Kern-Bibliotheken). Warnt explizit bei fehlendem DNF-Plugin.
+* **Desktop-Benachrichtigungen:** Sendet nach Abschluss eines echten Update-Durchlaufs eine native Systembenachrichtigung (ideal für KDE Plasma oder GNOME).
 
-## **📋 Systemanforderungen**
+## 📋 Systemanforderungen
 
-> * **Betriebssystem:** Fedora Linux (oder kompatible RHEL-basierte Distributionen)  
-> * **Abhängigkeiten:** bash, sudo, dnf  
-> * **Optional:** flatpak (für App-Updates), snapd (für Snap-Updates), libnotify (für Desktop-Benachrichtigungen via notify-send)
+* **Betriebssystem:** ausschließlich Fedora Linux (das Skript prüft `/etc/fedora-release` und bricht auf anderen Distributionen ab)
+* **Abhängigkeiten:** `bash`, `sudo`, `dnf`, `rpm`, `uname`, `sort`, `date` sowie `tee` bei Nutzung von `--log` (auf Fedora standardmäßig vorhanden)
+* **Optional:** `flatpak` (für App-Updates), `snapd` (für Snap-Updates), `libnotify` (für Desktop-Benachrichtigungen via `notify-send`)
 
-## **🛠️ Installation**
+## 🛠️ Installation
 
-> 1. Das Repository klonen oder das Skript herunterladen.  
-> 2. Das Skript ausführbar machen:  
->    chmod \+x update-system.sh  
-> 3. **(Optional)** Das Skript in den lokalen Bin-Pfad verschieben, um es systemweit als Befehl (z. B. update-system) verfügbar zu machen:  
->    mkdir \-p \~/.local/bin  
->    mv update-system.sh \~/.local/bin/update-system*Hinweis: Möglicherweise muss das Terminal nach diesem Schritt neu gestartet werden.*
+1. Das Repository klonen oder das Skript herunterladen.
+2. Das Skript ausführbar machen:
 
-## **⚙️ Parameter & Konfiguration**
+   ```bash
+   chmod +x update-system.sh
+   ```
 
-Das Skript wird nun primär über Kommandozeilen-Parameter beim Aufruf gesteuert:
+3. **(Optional)** Das Skript in den lokalen Bin-Pfad verschieben, um es als Befehl `update-system` verfügbar zu machen:
 
-> * **\--autoremove**: Führt nach dem DNF-Upgrade automatisch ein *dnf autoremove* aus, um ungenutzte Abhängigkeiten zu entfernen.  
-> * **\--snap**: Aktiviert die Aktualisierung von Snap-Paketen (standardmäßig übersprungen, da Snap unter Fedora nicht vorinstalliert ist).  
-> * **\--log \<Dateipfad\>**: Speichert die gesamte Terminalausgabe (inkl. Fehler) zusätzlich in der angegebenen Logdatei.  
-> * **\--dry-run**: Zeigt nur an, welche Befehle ausgeführt würden (DNF-Upgrade, Autoremove, Flatpak, Snap), ohne Änderungen am System vorzunehmen. Es werden dabei keine Administratorrechte angefordert; der detaillierte Neustart-Check am Ende entfällt daher (eine bereits erkennbare neue Kernel-Version wird weiterhin angezeigt).  
-> * **\-h, \--help**: Zeigt eine Übersicht aller Parameter an und beendet das Skript.
+   ```bash
+   mkdir -p ~/.local/bin
+   mv update-system.sh ~/.local/bin/update-system
+   ```
 
-## **💻 Nutzung**
+   *Hinweis: Wurde `~/.local/bin` gerade erst angelegt, muss das Terminal danach eventuell neu gestartet werden, damit der Ordner im `PATH` landet.*
+
+## ⚙️ Parameter
+
+| Parameter | Beschreibung |
+|---|---|
+| `--autoremove` | Führt nach dem DNF-Upgrade automatisch `dnf autoremove` aus, um ungenutzte Abhängigkeiten zu entfernen. |
+| `--snap` | Aktiviert die Aktualisierung von Snap-Paketen (standardmäßig übersprungen, da Snap unter Fedora nicht vorinstalliert ist). |
+| `--log <Dateipfad>` | Speichert die gesamte Terminalausgabe (inkl. Fehler) zusätzlich in der angegebenen Logdatei. Farben werden dabei deaktiviert. |
+| `--dry-run` | Zeigt nur an, welche Befehle ausgeführt würden (DNF-Upgrade, Autoremove, Flatpak, Snap), ohne Änderungen am System vorzunehmen. Es werden keine Administratorrechte angefordert; der detaillierte Neustart-Check entfällt daher (eine bereits erkennbare neue Kernel-Version wird weiterhin angezeigt). Es wird keine Desktop-Benachrichtigung gesendet. |
+| `-h`, `--help` | Zeigt eine Übersicht aller Parameter an und beendet das Skript. |
+
+## 💻 Nutzung
 
 Standard-Aufruf (nur DNF & Flatpak, ohne Logging):
 
+```bash
 ./update-system.sh
+```
 
 Aufruf mit allen Optionen (Autoremove, Snap-Updates und Logging):
 
-./update-system.sh \--autoremove \--snap \--log mein-update.log
+```bash
+./update-system.sh --autoremove --snap --log mein-update.log
+```
 
-Testlauf ohne Änderungen am System (zeigt nur an, was ausgeführt würde):
+Testlauf ohne Änderungen am System:
 
-./update-system.sh \--dry-run
+```bash
+./update-system.sh --dry-run
+```
 
-Wenn das Skript nach \~/.local/bin verschoben wurde, genügt der systemweite Aufruf:
+Wenn das Skript nach `~/.local/bin` verschoben wurde, genügt:
 
-update-system \--autoremove
+```bash
+update-system --autoremove
+```
 
-Beim Start wird einmalig das Sudo-Passwort abgefragt. Danach läuft das Skript vollautomatisch durch.
+Das Skript darf **nicht** mit `sudo` gestartet werden. Bei einem normalen Durchlauf wird zu Beginn einmalig das Sudo-Passwort abgefragt, danach läuft das Skript vollautomatisch durch. Im Dry-Run entfällt die Passwortabfrage.
 
-## **⚠️ Bekannte Einschränkungen**
+## 🔢 Exit-Codes
 
-> * **dnf5 (Fedora 41+):** Fedora 41 hat den Befehl `dnf` standardmäßig durch `dnf5` ersetzt (der Aufruf `dnf` bleibt als Alias erhalten). Die im Skript verwendete Neustart-Prüfung (`dnf needs-restarting -r`) sollte auch unter dnf5 kompatibel sein, wurde für dieses Skript aber nicht auf einem echten dnf5-System verifiziert.  
-> * **Desktop-Benachrichtigungen:** `notify-send` wird nur aufgerufen, wenn eine aktive Desktop-Session erkannt wird (`DBUS_SESSION_BUS_ADDRESS` gesetzt). Bei einer reinen SSH-Sitzung ohne grafische Session wird die Benachrichtigung übersprungen.
+| Code | Bedeutung |
+|---|---|
+| `0` | Alle Schritte erfolgreich bzw. Dry-Run abgeschlossen |
+| `1` | Ungültiger Aufruf oder Update mit Teilfehlern (Flatpak/Snap) |
+| sonstige | Abbruch durch einen fehlgeschlagenen Befehl (z. B. DNF); die Fehlerzeile wird ausgegeben |
 
-## **🤖 Hinweis zur Erstellung**
+Ein empfohlener Neustart ändert den Exit-Code nicht, sondern wird nur in der Ausgabe gemeldet.
+
+## ⚠️ Bekannte Einschränkungen
+
+* **dnf5 (Fedora 41+):** Seit Fedora 41 ist `dnf` ein Alias für `dnf5`. Die Neustart-Prüfung (`dnf needs-restarting -r`) benötigt dort das Paket `dnf5-plugins` (unter dnf4: `python3-dnf-plugins-core`). Das Verhalten unter dnf5 wurde für dieses Skript nicht auf einem echten System verifiziert.
+* **Desktop-Benachrichtigungen:** `notify-send` wird nur aufgerufen, wenn eine aktive Desktop-Session erkannt wird (`DBUS_SESSION_BUS_ADDRESS` gesetzt). Bei einer reinen SSH-Sitzung wird die Benachrichtigung übersprungen.
+
+## 🤖 Hinweis zur Erstellung
 
 Dieses Skript sowie die vorliegende Dokumentation wurden mit Unterstützung von Künstlicher Intelligenz (KI) erstellt und optimiert.
 
-## **📄 Lizenz**
+## 📄 Lizenz
 
 Dieses Projekt ist Open Source und steht unter der MIT-Lizenz. Der Quellcode kann frei verwendet, angepasst und weitergegeben werden.
