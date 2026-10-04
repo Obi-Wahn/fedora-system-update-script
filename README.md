@@ -46,7 +46,7 @@ Ein robustes und automatisiertes Bash-Skript, um Fedora Linux effizient auf dem 
 |---|---|
 | `--autoremove` | Führt nach dem DNF-Upgrade automatisch `dnf autoremove` aus, um ungenutzte Abhängigkeiten zu entfernen. |
 | `--snap` | Aktiviert die Aktualisierung von Snap-Paketen (standardmäßig übersprungen, da Snap unter Fedora nicht vorinstalliert ist). |
-| `--firmware` | Spielt Firmware-Updates über fwupd ein (`fwupdmgr refresh` und `fwupdmgr update`). Gibt es keine Updates, ist das kein Fehler. Benötigt ein Update einen Neustart, wird dieser nur empfohlen; viele UEFI-Updates werden erst beim nächsten Neustart eingespielt. |
+| `--firmware` | Spielt Firmware-Updates über fwupd ein (`fwupdmgr refresh`, `get-updates` und `update`). Gibt es keine Updates, ist das kein Fehler, und es wird nichts installiert. Ein Neustart wird nur empfohlen, wenn tatsächlich Firmware eingespielt wurde (viele UEFI-Updates werden erst beim nächsten Neustart installiert), aber nie automatisch ausgelöst. |
 | `--log <Dateipfad>` | Speichert die gesamte Terminalausgabe (inkl. Fehler) zusätzlich in der angegebenen Logdatei. Farben werden dabei deaktiviert. |
 | `--dry-run` | Zeigt nur an, welche Befehle ausgeführt würden (DNF-Upgrade, Autoremove, Flatpak, Snap), ohne Änderungen am System vorzunehmen. Es werden keine Administratorrechte angefordert; der detaillierte Neustart-Check entfällt daher (eine bereits erkennbare neue Kernel-Version wird weiterhin angezeigt). Es wird keine Desktop-Benachrichtigung gesendet. |
 | `-h`, `--help` | Zeigt eine Übersicht aller Parameter an und beendet das Skript. |
@@ -99,6 +99,7 @@ Ein empfohlener Neustart ändert den Exit-Code nicht, sondern wird nur in der Au
 | `Neustartstatus unklar (…)` | Das `needs-restarting`-Plugin fehlt: `sudo dnf install dnf5-plugins` (unter dnf4: `python3-dnf-plugins-core`). |
 | `Snap ist zwar installiert, aber der snapd-Dienst ist nicht aktiv.` | Snap-Dienst aktivieren: `sudo systemctl enable --now snapd.socket` |
 | `Flatpak-Update meldete einen Fehler` | `flatpak update` von Hand ausführen, um die genaue Fehlermeldung zu sehen; mit `flatpak remotes` prüfen, ob die Quellen (z. B. Flathub) eingerichtet sind. |
+| `Nicht alle Firmware-Updates wurden eingespielt` | fwupd hat ein Update übersprungen, meist weil es eine Benutzeraktion braucht (z. B. Netzteil anschließen, Akku laden). Die Ausgabe von fwupd nennt den Grund; danach das Skript erneut mit `--firmware` starten. |
 | `Firmware-Update meldete einen Fehler` | `fwupdmgr update` von Hand ausführen, um die genaue Fehlermeldung zu sehen; `fwupdmgr get-devices` zeigt, welche Geräte fwupd unterstützt. |
 
 **Unbeaufsichtigte Updates (Cron, Timer):** Das Skript ist für den interaktiven Einsatz gedacht, weil es zu Beginn das Sudo-Passwort abfragt. Für automatische Updates ist auf Fedora `dnf-automatic` das passende Werkzeug (ab Fedora 41: Paket `dnf5-plugin-automatic`, Timer `dnf5-automatic.timer`).
