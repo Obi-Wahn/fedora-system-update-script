@@ -236,6 +236,10 @@ if [[ "$RUN_FIRMWARE_UPDATE" == "true" ]]; then
         run_step sudo fwupdmgr refresh || fw_rc=$?
         if (( fw_rc == 0 || fw_rc == 2 )); then
             fw_rc=0
+            # 'update' endet auch mit 0, wenn nichts installiert wurde. Daher vorher fragen, ob Updates anstehen.
+            run_step sudo fwupdmgr get-updates --no-unreported-check || fw_rc=$?
+        fi
+        if (( fw_rc == 0 )); then
             # --no-reboot-check: sonst startet '-y' den Rechner sofort neu, falls ein Update das verlangt
             run_step sudo fwupdmgr update -y --no-reboot-check --no-unreported-check || fw_rc=$?
         fi
@@ -245,7 +249,14 @@ if [[ "$RUN_FIRMWARE_UPDATE" == "true" ]]; then
             warning "Firmware-Update meldete einen Fehler (Code $fw_rc)."
             UPDATE_WARNINGS+=("Firmware")
         elif [[ "$DRY_RUN" != "true" ]]; then
-            FIRMWARE_UPDATED="true"
+            # Eingespielte Updates, auch solche, die auf einen Neustart warten, listet 'get-updates' nicht mehr.
+            # Geräte, die eine Benutzeraktion brauchen (z.B. Netzteil anschließen), stehen dagegen noch drin.
+            if sudo fwupdmgr get-updates --no-unreported-check >/dev/null 2>&1; then
+                warning "Nicht alle Firmware-Updates wurden eingespielt (z.B. weil ein Netzteil angeschlossen sein muss). Details stehen oben in der Ausgabe von fwupd."
+                UPDATE_WARNINGS+=("Firmware")
+            else
+                FIRMWARE_UPDATED="true"
+            fi
         fi
     else
         info "fwupd ist nicht installiert. Übersprungen."

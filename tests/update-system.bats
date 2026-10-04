@@ -193,41 +193,78 @@ not_called() {
 
 # --- Firmware --------------------------------------------------------------
 
+# fwupdmgr-Attrappe, Exit-Codes je Unterbefehl über Umgebungsvariablen steuerbar.
+# 'get-updates' liefert beim ersten Aufruf MOCK_FW_GET_UPDATES_RC (Standard 0 = Updates verfügbar),
+# bei jedem weiteren Aufruf MOCK_FW_AFTER_RC (Standard 2 = alles eingespielt).
+mock_fwupd() {
+    mock fwupdmgr 'case "$1" in
+    refresh) exit "${MOCK_FW_REFRESH_RC:-0}" ;;
+    get-updates)
+        if [[ -e "$0.state" ]]; then exit "${MOCK_FW_AFTER_RC:-2}"; fi
+        touch "$0.state"
+        exit "${MOCK_FW_GET_UPDATES_RC:-0}" ;;
+    update) exit "${MOCK_FW_UPDATE_RC:-0}" ;;
+esac'
+}
+
 @test "Firmware wird ohne --firmware nicht angefasst" {
-    mock fwupdmgr
+    mock_fwupd
     run_script
     [ "$status" -eq 0 ]
     not_called "^fwupdmgr"
 }
 
 @test "Firmware-Update startet den Rechner nie selbst neu" {
-    mock fwupdmgr
+    mock_fwupd
     run_script --firmware
     [ "$status" -eq 0 ]
     called "sudo fwupdmgr refresh"
+    called "sudo fwupdmgr get-updates --no-unreported-check"
     called "sudo fwupdmgr update -y --no-reboot-check --no-unreported-check"
     [[ "$output" == *"Neustart empfohlen (Firmware aktualisiert"* ]]
 }
 
-@test "Firmware: keine Updates verfügbar (Code 2) ist kein Fehler" {
-    mock fwupdmgr 'exit 2'
+@test "Firmware: ohne verfügbare Updates wird nichts installiert und kein Neustart empfohlen" {
+    export MOCK_FW_GET_UPDATES_RC=2
+    mock_fwupd
     run_script --firmware
     [ "$status" -eq 0 ]
+    not_called "^fwupdmgr update"
     [[ "$output" == *"Keine Firmware-Updates verfügbar"* ]]
     [[ "$output" == *"Kein Neustart erforderlich"* ]]
 }
 
-@test "Firmware: Fehler ergibt Teilfehler und Exit-Code 1" {
-    mock fwupdmgr '[[ "$1" == update ]] && exit 1; exit 0'
+@test "Firmware: bereits aktuelle Metadaten (refresh mit Code 2) sind kein Fehler" {
+    export MOCK_FW_REFRESH_RC=2
+    mock_fwupd
+    run_script --firmware
+    [ "$status" -eq 0 ]
+    called "sudo fwupdmgr update -y --no-reboot-check --no-unreported-check"
+}
+
+@test "Firmware: nicht eingespielte Updates (z.B. ohne Netzteil) ergeben eine Warnung statt Neustart-Empfehlung" {
+    export MOCK_FW_AFTER_RC=0
+    mock_fwupd
+    run_script --firmware
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Nicht alle Firmware-Updates wurden eingespielt"* ]]
+    [[ "$output" != *"Firmware aktualisiert"* ]]
+}
+
+@test "Firmware: Fehler beim Einspielen ergibt Teilfehler und Exit-Code 1" {
+    export MOCK_FW_UPDATE_RC=1
+    mock_fwupd
     run_script --firmware
     [ "$status" -eq 1 ]
     [[ "$output" == *"Update mit Teilfehlern abgeschlossen (Firmware)"* ]]
 }
 
 @test "Firmware: Fehler beim Aktualisieren der Metadaten überspringt das Update" {
-    mock fwupdmgr '[[ "$1" == refresh ]] && exit 1; exit 0'
+    export MOCK_FW_REFRESH_RC=1
+    mock_fwupd
     run_script --firmware
     [ "$status" -eq 1 ]
+    not_called "^fwupdmgr get-updates"
     not_called "^fwupdmgr update"
 }
 
@@ -238,9 +275,10 @@ not_called() {
 }
 
 @test "Firmware: Dry-Run zeigt die Befehle nur an" {
-    mock fwupdmgr
+    mock_fwupd
     run_script --firmware --dry-run
     [ "$status" -eq 0 ]
+    [[ "$output" == *"[DRY-RUN] Würde ausführen: sudo fwupdmgr get-updates --no-unreported-check"* ]]
     [[ "$output" == *"[DRY-RUN] Würde ausführen: sudo fwupdmgr update -y --no-reboot-check"* ]]
     not_called "^fwupdmgr"
 }
