@@ -54,11 +54,12 @@ print_usage() {
     cat <<EOF
 Verwendung: ${0##*/} [OPTIONEN]
 
-Aktualisiert ein Fedora-System (DNF, Flatpak, optional Snap) in einem
-abgesicherten Durchlauf.
+Aktualisiert ein Fedora-System (DNF, Flatpak, optional Snap und Firmware)
+in einem abgesicherten Durchlauf.
 
 Optionen:
-  --autoremove     Führt nach dem DNF-Upgrade 'dnf autoremove' aus.
+  --autoremove     Entfernt nicht mehr benötigte Pakete ('dnf autoremove')
+                   und ungenutzte Flatpak-Laufzeitumgebungen.
   --snap           Aktiviert Snap-Updates (falls installiert und aktiv).
   --firmware       Spielt Firmware-Updates über fwupd ein (falls installiert).
                    Ein dafür nötiger Neustart erfolgt nicht automatisch.
@@ -72,7 +73,8 @@ Optionen:
 
 Exit-Codes:
   0                Alle Schritte erfolgreich (bzw. Dry-Run abgeschlossen).
-  1                Ungültiger Aufruf oder Teilfehler (Flatpak/Snap/Firmware).
+  1                Ungültiger Aufruf, ungeeignete Umgebung (kein Fedora,
+                   Start als root) oder Teilfehler (Flatpak/Snap/Firmware).
   sonstige         Abbruch durch einen fehlgeschlagenen Befehl.
 EOF
 }
@@ -203,6 +205,13 @@ if command -v flatpak &>/dev/null; then
         warning "Flatpak-Update meldete einen Fehler (z.B. Repo unerreichbar)."
         UPDATE_WARNINGS+=("Flatpak")
     }
+    if [[ "$RUN_AUTOREMOVE" == "true" ]]; then
+        info "Entferne ungenutzte Flatpak-Laufzeitumgebungen..."
+        run_step flatpak uninstall --unused -y || {
+            warning "Entfernen ungenutzter Flatpak-Laufzeitumgebungen meldete einen Fehler."
+            UPDATE_WARNINGS+=("Flatpak-Aufräumen")
+        }
+    fi
 else
     info "Flatpak ist nicht installiert. Übersprungen."
 fi

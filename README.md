@@ -1,6 +1,6 @@
 # Fedora System Update Script
 
-Ein robustes und automatisiertes Bash-Skript, um Fedora Linux effizient auf dem neuesten Stand zu halten. Das Skript aktualisiert sowohl die regulären Systempakete (via DNF) als auch isolierte Anwendungen (via Flatpak und optional Snap) in einem einzigen, abgesicherten Durchlauf.
+Ein robustes und automatisiertes Bash-Skript, um Fedora Linux effizient auf dem neuesten Stand zu halten. Das Skript aktualisiert sowohl die regulären Systempakete (via DNF) als auch isolierte Anwendungen (via Flatpak und optional Snap) und auf Wunsch die Firmware (via fwupd) in einem einzigen, abgesicherten Durchlauf.
 
 ## 🚀 Funktionen
 
@@ -44,7 +44,7 @@ Ein robustes und automatisiertes Bash-Skript, um Fedora Linux effizient auf dem 
 
 | Parameter | Beschreibung |
 |---|---|
-| `--autoremove` | Führt nach dem DNF-Upgrade automatisch `dnf autoremove` aus, um ungenutzte Abhängigkeiten zu entfernen. |
+| `--autoremove` | Entfernt nach den Updates nicht mehr benötigte Pakete (`dnf autoremove`) und ungenutzte Flatpak-Laufzeitumgebungen (`flatpak uninstall --unused`). Laufzeitumgebungen, die noch von einer App genutzt werden, bleiben erhalten. |
 | `--snap` | Aktiviert die Aktualisierung von Snap-Paketen (standardmäßig übersprungen, da Snap unter Fedora nicht vorinstalliert ist). |
 | `--firmware` | Spielt Firmware-Updates über fwupd ein (`fwupdmgr refresh`, `get-updates` und `update`). Gibt es keine Updates, ist das kein Fehler, und es wird nichts installiert. Ein Neustart wird nur empfohlen, wenn tatsächlich Firmware eingespielt wurde (viele UEFI-Updates werden erst beim nächsten Neustart installiert), aber nie automatisch ausgelöst. |
 | `--log <Dateipfad>` | Speichert die gesamte Terminalausgabe (inkl. Fehler) zusätzlich in der angegebenen Logdatei. Farben werden dabei deaktiviert. |
@@ -84,7 +84,7 @@ Das Skript darf **nicht** mit `sudo` gestartet werden. Bei einem normalen Durchl
 | Code | Bedeutung |
 |---|---|
 | `0` | Alle Schritte erfolgreich bzw. Dry-Run abgeschlossen |
-| `1` | Ungültiger Aufruf oder Update mit Teilfehlern (Flatpak/Snap/Firmware) |
+| `1` | Ungültiger Aufruf, ungeeignete Umgebung (kein Fedora, Start als root) oder Update mit Teilfehlern (Flatpak/Snap/Firmware) |
 | sonstige | Abbruch durch einen fehlgeschlagenen Befehl (z. B. DNF); die Fehlerzeile wird ausgegeben |
 
 Ein empfohlener Neustart ändert den Exit-Code nicht, sondern wird nur in der Ausgabe gemeldet.
@@ -106,7 +106,7 @@ Ein empfohlener Neustart ändert den Exit-Code nicht, sondern wird nur in der Au
 
 ## ⚠️ Bekannte Einschränkungen
 
-* **dnf5 (Fedora 41+):** Seit Fedora 41 ist `dnf` ein Alias für `dnf5`. Die Neustart-Prüfung (`dnf needs-restarting -r`) benötigt dort das Paket `dnf5-plugins` (unter dnf4: `python3-dnf-plugins-core`). Unter dnf5 5.4 (Fedora 44) wird `-r` nur noch aus Kompatibilitätsgründen akzeptiert und hat keine eigene Wirkung, der Aufruf funktioniert also. Einen nötigen Neustart meldet `needs-restarting` mit Exit-Code 1; weil auch Fehler (z. B. ein fehlendes Plugin) mit 1 enden, prüft das Skript zusätzlich den Ausgabetext „Reboot is required“. Das Verhalten ist dem dnf5-Quelltext entnommen; ein vollständiger Lauf auf einem echten Fedora-System steht noch aus.
+* **dnf5 (Fedora 41+):** Seit Fedora 41 ist `dnf` ein Alias für `dnf5`. Die Neustart-Prüfung (`dnf needs-restarting -r`) benötigt dort das Paket `dnf5-plugins` (unter dnf4: `python3-dnf-plugins-core`). Unter dnf5 5.4 (Fedora 44) wird `-r` nur noch aus Kompatibilitätsgründen akzeptiert und hat keine eigene Wirkung, der Aufruf funktioniert also. Einen nötigen Neustart meldet `needs-restarting` mit Exit-Code 1; weil auch Fehler (z. B. ein fehlendes Plugin) mit 1 enden, prüft das Skript zusätzlich den Ausgabetext „Reboot is required“. Das Verhalten ist dem dnf5-Quelltext entnommen. Auf einem echten Fedora-44-System bestätigt ist bisher der Fall ohne nötigen Neustart; der Fall „Neustart nötig“ wurde dort noch nicht beobachtet.
 * **Flatpak:** `flatpak update` aktualisiert sowohl Benutzer- als auch systemweite Installationen. Bei systemweiten Installationen kann polkit nach einem Passwort fragen, z. B. bei einer SSH-Sitzung.
 * **Desktop-Benachrichtigungen:** `notify-send` wird nur aufgerufen, wenn eine aktive Desktop-Session erkannt wird (`DBUS_SESSION_BUS_ADDRESS` gesetzt). Bei einer reinen SSH-Sitzung wird die Benachrichtigung übersprungen.
 

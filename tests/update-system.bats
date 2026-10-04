@@ -117,6 +117,7 @@ not_called() {
     [[ "$output" == *"[DRY-RUN] Würde ausführen: sudo dnf upgrade --refresh -y"* ]]
     [[ "$output" == *"[DRY-RUN] Würde ausführen: sudo dnf autoremove -y"* ]]
     [[ "$output" == *"[DRY-RUN] Würde ausführen: flatpak update -y"* ]]
+    [[ "$output" == *"[DRY-RUN] Würde ausführen: flatpak uninstall --unused -y"* ]]
     [[ "$output" == *"Dry-Run abgeschlossen"* ]]
     [[ "$output" != *"ohne Fehler ausgeführt"* ]]
     not_called "^sudo"
@@ -166,6 +167,28 @@ not_called() {
     run_script
     [ "$status" -eq 1 ]
     [[ "$output" == *"Update mit Teilfehlern abgeschlossen (Flatpak)"* ]]
+}
+
+@test "--autoremove entfernt ungenutzte Flatpak-Laufzeitumgebungen" {
+    mock flatpak
+    run_script --autoremove
+    [ "$status" -eq 0 ]
+    called "flatpak update -y"
+    called "flatpak uninstall --unused -y"
+}
+
+@test "ohne --autoremove bleiben Flatpak-Laufzeitumgebungen unangetastet" {
+    mock flatpak
+    run_script
+    [ "$status" -eq 0 ]
+    not_called "^flatpak uninstall"
+}
+
+@test "Fehler beim Flatpak-Aufräumen ergibt Teilfehler und Exit-Code 1" {
+    mock flatpak '[[ "$1" == uninstall ]] && exit 1; exit 0'
+    run_script --autoremove
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Update mit Teilfehlern abgeschlossen (Flatpak-Aufräumen)"* ]]
 }
 
 @test "fehlendes Flatpak ist nur ein Hinweis" {
