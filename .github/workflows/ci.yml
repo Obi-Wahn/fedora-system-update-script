@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: ShellCheck installieren (falls nicht vorhanden)
+        run: command -v shellcheck || (sudo apt-get update && sudo apt-get install -y shellcheck)
+      - name: Skript prüfen
+        run: shellcheck update-system.sh
+
+  tests:
+    name: Tests (Fedora)
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - name: Testwerkzeuge installieren
+        run: dnf install -y bats util-linux sudo
+      - uses: actions/checkout@v5
+      # Das Skript verweigert den Start als root, daher laufen die Tests als normaler Benutzer
+      - name: Tests als normaler Benutzer ausführen
+        run: |
+          useradd -m tester
+          chown -R tester "$GITHUB_WORKSPACE"
+          sudo -u tester bats tests/

@@ -12,6 +12,7 @@ set -Eeuo pipefail
 
 RUN_AUTOREMOVE="false"
 RUN_SNAP_UPDATE="false"
+RUN_FIRMWARE_UPDATE="false"
 DRY_RUN="false"
 LOGFILE=""
 
@@ -59,6 +60,8 @@ abgesicherten Durchlauf.
 Optionen:
   --autoremove     Führt nach dem DNF-Upgrade 'dnf autoremove' aus.
   --snap           Aktiviert Snap-Updates (falls installiert und aktiv).
+  --firmware       Spielt Firmware-Updates über fwupd ein (falls installiert).
+                   Ein dafür nötiger Neustart erfolgt nicht automatisch.
   --log <Datei>    Schreibt die komplette Ausgabe zusätzlich in <Datei>
                    (Farben werden dabei deaktiviert).
   --dry-run        Zeigt nur an, welche Befehle ausgeführt würden, ohne
@@ -69,7 +72,7 @@ Optionen:
 
 Exit-Codes:
   0                Alle Schritte erfolgreich (bzw. Dry-Run abgeschlossen).
-  1                Ungültiger Aufruf oder Teilfehler (Flatpak/Snap).
+  1                Ungültiger Aufruf oder Teilfehler (Flatpak/Snap/Firmware).
   sonstige         Abbruch durch einen fehlgeschlagenen Befehl.
 EOF
 }
@@ -82,6 +85,7 @@ while [[ "$#" -gt 0 ]]; do
     case $1 in
         --autoremove) RUN_AUTOREMOVE="true" ;;
         --snap) RUN_SNAP_UPDATE="true" ;;
+        --firmware) RUN_FIRMWARE_UPDATE="true" ;;
         --dry-run) DRY_RUN="true" ;;
         -h|--help)
             print_usage
@@ -145,6 +149,7 @@ if [[ -n "$LOGFILE" ]]; then
 fi
 
 # Traps für Fehler und sauberes Beenden
+# shellcheck disable=SC2154  # err_code wird im Trap-String selbst gesetzt
 trap 'err_code=$?; error "Fehler in Zeile $LINENO (Code $err_code): $BASH_COMMAND"; error "Update abgebrochen."; exit $err_code' ERR
 
 # shellcheck disable=SC2317  # wird indirekt über 'trap cleanup EXIT' aufgerufen
@@ -172,8 +177,9 @@ else
     info "Fordere Administratorrechte an..."
     sudo -v
 
-    # Sudo-Ticket im Hintergrund alle 50s erneuern
-    ( while kill -0 $$ 2>/dev/null; do sudo -n -v 2>/dev/null || true; sleep 50; done ) &
+    # Sudo-Ticket im Hintergrund alle 50s erneuern. Die Umleitung nach /dev/null verhindert,
+    # dass ein noch laufendes 'sleep' nach Skriptende eine Ausgabe-Pipe (z.B. '| tee') offen hält.
+    ( while kill -0 $$ 2>/dev/null; do sudo -n -v 2>/dev/null || true; sleep 50; done ) </dev/null >/dev/null 2>&1 &
     SUDO_KEEPALIVE_PID=$!
 fi
 
@@ -221,6 +227,34 @@ else
 fi
 
 printf '\n'
+FIRMWARE_UPDATED="false"
+if [[ "$RUN_FIRMWARE_UPDATE" == "true" ]]; then
+    info "Starte Firmware-Updates via fwupd..."
+    if command -v fwupdmgr &>/dev/null; then
+        # fwupdmgr meldet Exit-Code 2, wenn es nichts zu tun gibt
+        fw_rc=0
+        run_step sudo fwupdmgr refresh || fw_rc=$?
+        if (( fw_rc == 0 || fw_rc == 2 )); then
+            fw_rc=0
+            # --no-reboot-check: sonst startet '-y' den Rechner sofort neu, falls ein Update das verlangt
+            run_step sudo fwupdmgr update -y --no-reboot-check --no-unreported-check || fw_rc=$?
+        fi
+        if (( fw_rc == 2 )); then
+            info "Keine Firmware-Updates verfügbar."
+        elif (( fw_rc != 0 )); then
+            warning "Firmware-Update meldete einen Fehler (Code $fw_rc)."
+            UPDATE_WARNINGS+=("Firmware")
+        elif [[ "$DRY_RUN" != "true" ]]; then
+            FIRMWARE_UPDATED="true"
+        fi
+    else
+        info "fwupd ist nicht installiert. Übersprungen."
+    fi
+else
+    info "Firmware-Updates sind nicht aktiviert (nutze --firmware). Übersprungen."
+fi
+
+printf '\n'
 info "Prüfe Systemstatus..."
 
 # Sichere Kernel-Prüfung
@@ -239,13 +273,19 @@ elif [[ "$DRY_RUN" == "true" ]]; then
     REBOOT_MSG="Genauer Neustart-Status im Dry-Run nicht geprüft (erfordert Root-Rechte)."
     REBOOT_COLOR="$BLUE"
     REBOOT_ICON="ℹ"
-elif NEEDS_RESTART_OUTPUT=$(sudo dnf needs-restarting -r 2>&1); then
+elif [[ "$FIRMWARE_UPDATED" == "true" ]]; then
+    REBOOT_MSG="System-Neustart empfohlen (Firmware aktualisiert; manche Updates werden erst beim Neustart eingespielt)."
+    REBOOT_COLOR="$YELLOW"
+    REBOOT_ICON="⚠"
+elif NEEDS_RESTART_OUTPUT=$(sudo env LC_ALL=C dnf needs-restarting -r 2>&1); then
     REBOOT_MSG="Kein Neustart erforderlich."
     REBOOT_COLOR="$GREEN"
     REBOOT_ICON="✔"
 else
     NEEDS_RESTART_RC=$?
-    if (( NEEDS_RESTART_RC == 1 )); then
+    # Code 1 bedeutet "Neustart nötig", aber auch allgemeine Fehler (z.B. fehlendes Plugin unter dnf4)
+    # enden mit 1. Daher zusätzlich den Ausgabetext prüfen; LC_ALL=C sorgt für englische Ausgabe.
+    if (( NEEDS_RESTART_RC == 1 )) && [[ "$NEEDS_RESTART_OUTPUT" == *"Reboot is required"* ]]; then
         REBOOT_MSG="System-Neustart empfohlen (Systemkomponenten aktualisiert)."
         REBOOT_COLOR="$YELLOW"
         REBOOT_ICON="⚠"
