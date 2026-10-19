@@ -332,6 +332,14 @@ esac'
     [[ "$output" == *"Neustart empfohlen (Systemkomponenten aktualisiert)"* ]]
 }
 
+@test "needs-restarting-Hinweistext wird unabhängig von Groß-/Kleinschreibung erkannt" {
+    export MOCK_NEEDS_RESTARTING_RC=1
+    export MOCK_NEEDS_RESTARTING_OUTPUT="REBOOT IS REQUIRED to fully utilize these updates."
+    run_script
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Neustart empfohlen (Systemkomponenten aktualisiert)"* ]]
+}
+
 @test "needs-restarting mit Code 1, aber Fehlermeldung, gilt als unklar" {
     export MOCK_NEEDS_RESTARTING_RC=1
     export MOCK_NEEDS_RESTARTING_OUTPUT="No such command: needs-restarting."

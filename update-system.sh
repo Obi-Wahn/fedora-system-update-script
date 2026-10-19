@@ -305,7 +305,8 @@ else
     NEEDS_RESTART_RC=$?
     # Code 1 bedeutet "Neustart nötig", aber auch allgemeine Fehler (z.B. fehlendes Plugin unter dnf4)
     # enden mit 1. Daher zusätzlich den Ausgabetext prüfen; LC_ALL=C sorgt für englische Ausgabe.
-    if (( NEEDS_RESTART_RC == 1 )) && [[ "$NEEDS_RESTART_OUTPUT" == *"Reboot is required"* ]]; then
+    # Groß-/Kleinschreibung wird ignoriert, damit eine geänderte Schreibweise in dnf5 nicht stört.
+    if (( NEEDS_RESTART_RC == 1 )) && [[ "${NEEDS_RESTART_OUTPUT,,}" == *"reboot is required"* ]]; then
         REBOOT_MSG="System-Neustart empfohlen (Systemkomponenten aktualisiert)."
         REBOOT_COLOR="$YELLOW"
         REBOOT_ICON="⚠"
