@@ -131,8 +131,7 @@ if [[ "${EUID:-}" -eq 0 ]]; then
 fi
 
 # Abhängigkeiten prüfen
-required_commands=(sudo dnf rpm uname sort date)
-[[ -n "$LOGFILE" ]] && required_commands+=(tee)
+required_commands=(sudo dnf rpm uname sort date tee mktemp rm)
 for cmd in "${required_commands[@]}"; do
     if ! command -v "$cmd" &>/dev/null; then
         error "Erforderlicher Befehl fehlt: $cmd"
@@ -159,6 +158,9 @@ cleanup() {
     if [[ -n "${SUDO_KEEPALIVE_PID:-}" ]]; then
         kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
         wait "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+    fi
+    if [[ -n "${FLATPAK_OUTPUT_FILE:-}" ]]; then
+        rm -f "$FLATPAK_OUTPUT_FILE"
     fi
 }
 trap cleanup EXIT
@@ -197,21 +199,78 @@ else
     info "DNF 'autoremove' ist nicht aktiviert (nutze --autoremove). Übersprungen."
 fi
 
+# Führt einen flatpak-Befehl für eine Installation ('system' oder 'user') aus: flatpak_step <scope> <befehl> [args...]
+# Die Ausgabe erscheint wie gewohnt und wird zusätzlich in FLATPAK_OUTPUT_FILE gesammelt (für den EOL-Hinweis).
+# - FLATPAK_FANCY_OUTPUT=0 schaltet die sich ständig neu zeichnende Fortschrittstabelle ab, die bei vielen
+#   Updates oder schmalem Terminal zu unlesbaren Zeilen führt.
+# - Die systemweite Installation läuft über sudo. Ohne Rechte entscheidet polkit, und das verweigert z.B.
+#   ohne aktive lokale Sitzung "Deploy"/"GetRevokefsFd" ("not allowed for user").
+# - FLATPAK_USER_DIR zeigt dabei auf die Benutzerinstallation des Aufrufers. flatpak berücksichtigt so beim
+#   Aufräumen weiterhin Benutzer-Apps, die Laufzeitumgebungen der Systeminstallation nutzen (sonst sähe es nur
+#   die Benutzerinstallation von root).
+flatpak_step() {
+    local scope=$1 cmd=$2
+    shift 2
+    if [[ "$scope" == "system" ]]; then
+        run_step sudo env FLATPAK_FANCY_OUTPUT=0 FLATPAK_USER_DIR="$FLATPAK_USER_DIR" \
+            flatpak "$cmd" --system "$@" 2>&1 | tee -a "$FLATPAK_OUTPUT_FILE"
+    else
+        run_step env FLATPAK_FANCY_OUTPUT=0 flatpak "$cmd" --user "$@" 2>&1 | tee -a "$FLATPAK_OUTPUT_FILE"
+    fi
+}
+
+# Sammelt aus der flatpak-Ausgabe veraltete (end-of-life) Laufzeitumgebungen und die Apps, die sie noch nutzen.
+# Diese werden bewusst nicht entfernt; das Skript weist am Ende nur darauf hin.
+FLATPAK_EOL_RUNTIMES=()
+FLATPAK_EOL_APPS=()
+collect_flatpak_eol() {
+    local line entry in_apps="false"
+    local -A seen=()
+    while IFS= read -r line; do
+        if [[ "$line" =~ runtime\ ([^[:space:]]+)\ branch\ ([^[:space:]]+)\ is\ end-of-life ]]; then
+            entry="${BASH_REMATCH[1]}//${BASH_REMATCH[2]}"
+            [[ -n "${seen[$entry]:-}" ]] || { seen[$entry]=1; FLATPAK_EOL_RUNTIMES+=("$entry"); }
+            in_apps="false"
+        elif [[ "$line" == *"using this runtime:"* || "$line" == *"using this extension:"* ]]; then
+            in_apps="true"
+        elif [[ "$in_apps" == "true" && "$line" =~ ^[[:space:]]+([^[:space:]]+)[[:space:]]*$ ]]; then
+            entry="${BASH_REMATCH[1]}"
+            [[ -n "${seen[$entry]:-}" ]] || { seen[$entry]=1; FLATPAK_EOL_APPS+=("$entry"); }
+        else
+            in_apps="false"
+        fi
+    done < "$FLATPAK_OUTPUT_FILE"
+}
+
 printf '\n'
 info "Starte Flatpak-Updates..."
 if command -v flatpak &>/dev/null; then
+    FLATPAK_USER_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/flatpak"
+    FLATPAK_OUTPUT_FILE=$(mktemp)
+    # Die Benutzerinstallation nur anfassen, wenn dort etwas installiert ist
+    FLATPAK_SCOPES=(system)
+    if [[ -n "$(flatpak list --user --columns=ref 2>/dev/null || true)" ]]; then
+        FLATPAK_SCOPES+=(user)
+    fi
+
     # Das '||' verhindert, dass set -e das Skript bei temporären Flatpak-Fehlern beendet
-    run_step flatpak update -y || {
-        warning "Flatpak-Update meldete einen Fehler (z.B. Repo unerreichbar)."
-        UPDATE_WARNINGS+=("Flatpak")
-    }
+    for scope in "${FLATPAK_SCOPES[@]}"; do
+        flatpak_step "$scope" update -y || {
+            warning "Flatpak-Update ($scope) meldete einen Fehler (z.B. Repo unerreichbar)."
+            [[ " ${UPDATE_WARNINGS[*]} " == *" Flatpak "* ]] || UPDATE_WARNINGS+=("Flatpak")
+        }
+    done
     if [[ "$RUN_AUTOREMOVE" == "true" ]]; then
         info "Entferne ungenutzte Flatpak-Laufzeitumgebungen..."
-        run_step flatpak uninstall --unused -y || {
-            warning "Entfernen ungenutzter Flatpak-Laufzeitumgebungen meldete einen Fehler."
-            UPDATE_WARNINGS+=("Flatpak-Aufräumen")
-        }
+        # 'uninstall --unused' entfernt nur, was keine installierte App mehr braucht (auch keine EOL-Laufzeitumgebungen in Benutzung)
+        for scope in "${FLATPAK_SCOPES[@]}"; do
+            flatpak_step "$scope" uninstall --unused -y || {
+                warning "Entfernen ungenutzter Flatpak-Laufzeitumgebungen ($scope) meldete einen Fehler."
+                [[ " ${UPDATE_WARNINGS[*]} " == *" Flatpak-Aufräumen "* ]] || UPDATE_WARNINGS+=("Flatpak-Aufräumen")
+            }
+        done
     fi
+    collect_flatpak_eol
 else
     info "Flatpak ist nicht installiert. Übersprungen."
 fi
@@ -284,9 +343,18 @@ if rpm -q kernel-core &>/dev/null; then
     LATEST_KERNEL=$(LC_ALL=C rpm -q kernel-core --queryformat '%{VERSION}-%{RELEASE}.%{ARCH}\n' | sort -V | tail -n 1 || true)
 fi
 
+# Nur ein installierter Kernel, der NEUER als der laufende ist, erfordert einen Neustart. Ein älterer
+# (z.B. weil ein selbst gebauter oder Test-Kernel läuft) ist kein Grund dafür.
+KERNEL_PENDING="false"
+if [[ -n "$LATEST_KERNEL" && "$CURRENT_KERNEL" != "$LATEST_KERNEL" ]] \
+    && [[ "$(printf '%s\n' "$CURRENT_KERNEL" "$LATEST_KERNEL" | sort -V | tail -n 1)" == "$LATEST_KERNEL" ]]; then
+    KERNEL_PENDING="true"
+fi
+
 # Neustart-Logik mit exakter Return-Code-Auswertung
-if [[ -n "$LATEST_KERNEL" && "$CURRENT_KERNEL" != "$LATEST_KERNEL" ]]; then
-    REBOOT_MSG="System-Neustart empfohlen (Neuer Kernel installiert)."
+if [[ "$KERNEL_PENDING" == "true" ]]; then
+    # Der neuere Kernel kann auch aus einem früheren Update stammen, nach dem noch nicht neu gestartet wurde
+    REBOOT_MSG="System-Neustart empfohlen (neuerer Kernel $LATEST_KERNEL installiert, es läuft noch $CURRENT_KERNEL)."
     REBOOT_COLOR="$YELLOW"
     REBOOT_ICON="⚠"
 elif [[ "$DRY_RUN" == "true" ]]; then
@@ -333,6 +401,16 @@ else
 fi
 
 printf '%b%s %s%b\n' "$REBOOT_COLOR" "$REBOOT_ICON" "$REBOOT_MSG" "$RESET"
+
+if [[ ${#FLATPAK_EOL_RUNTIMES[@]} -gt 0 ]]; then
+    eol_apps="unbekannt"
+    if [[ ${#FLATPAK_EOL_APPS[@]} -gt 0 ]]; then
+        eol_apps=$(IFS=,; printf '%s' "${FLATPAK_EOL_APPS[*]}")
+        eol_apps=${eol_apps//,/, }
+    fi
+    printf '%bℹ Hinweis: Veraltete Flatpak-Laufzeitumgebungen (end-of-life) werden noch genutzt und bleiben daher installiert. Betroffene Apps: %s. Abhilfe schafft nur ein Update der App durch ihre Entwickler.%b\n' \
+        "$BLUE" "$eol_apps" "$RESET"
+fi
 
 # Desktop-Benachrichtigung senden (nicht im Dry-Run und nur mit aktiver Desktop-Session, z.B. nicht über SSH)
 if [[ "$DRY_RUN" != "true" ]] && command -v notify-send &>/dev/null && [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then

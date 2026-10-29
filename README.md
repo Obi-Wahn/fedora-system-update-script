@@ -5,6 +5,8 @@ Ein robustes und automatisiertes Bash-Skript, um Fedora Linux effizient auf dem 
 ## 🚀 Funktionen
 
 * **Umfassendes Update:** Aktualisiert DNF-Pakete, Flatpak- und (optional) Snap-Anwendungen nacheinander.
+* **Flatpak mit Adminrechten:** Die systemweite Flatpak-Installation wird über `sudo` aktualisiert (kein polkit-Fehler „not allowed for user“ mehr), die Benutzerinstallation ohne `sudo` und nur, wenn dort etwas installiert ist. Die Ausgabe erscheint zeilenweise statt als sich ständig neu zeichnende Fortschrittstabelle und bleibt so auch in Logs und beim Kopieren lesbar.
+* **Hinweis auf veraltete Flatpak-Laufzeitumgebungen:** Meldet Flatpak Laufzeitumgebungen als „end-of-life“, die noch von installierten Apps genutzt werden, nennt das Skript am Ende die betroffenen Apps. Entfernt werden solche Laufzeitumgebungen nie.
 * **Flexible Parameter:** Über Kommandozeilen-Parameter lassen sich optionale Schritte wie *dnf autoremove*, *Snap-Updates* und das *Logging* aktivieren.
 * **Firmware-Updates (optional):** Spielt mit `--firmware` Firmware-Updates über fwupd ein. Ein dafür nötiger Neustart wird nur empfohlen, nie automatisch ausgelöst.
 * **Testlauf (Dry-Run):** Zeigt an, welche Befehle ausgeführt würden, ohne Änderungen am System vorzunehmen und ohne Administratorrechte anzufordern.
@@ -13,13 +15,13 @@ Ein robustes und automatisiertes Bash-Skript, um Fedora Linux effizient auf dem 
 * **Strikte Fehlerbehandlung:** Nutzt `set -Eeuo pipefail` und einen ERR-Trap, um bei Problemen sofort und mit genauer Fehlerzeile abzubrechen.
 * **Sudo-Keepalive:** Verhindert das Ablaufen des Sudo-Tickets bei langen Updates, sodass keine zweite Passworteingabe während des Vorgangs nötig ist.
 * **Defensive Programmierung:** Prüft automatisch auf das Vorhandensein optionaler Komponenten (Flatpak, Snap, fwupd, libnotify). Bei Snap wird zusätzlich geprüft, ob der Systemd-Dienst (snapd) aktiv ist. Fehlende Komponenten werden mit einem kurzen Hinweis übersprungen.
-* **Neustart-Prüfung:** Ermittelt, ob nach dem Update ein Systemneustart empfohlen wird (z. B. nach einem Kernel-Update oder bei Kern-Bibliotheken). Warnt explizit bei fehlendem DNF-Plugin.
+* **Neustart-Prüfung:** Ermittelt, ob nach dem Update ein Systemneustart empfohlen wird (z. B. nach einem Kernel-Update oder bei Kern-Bibliotheken). Ein Kernel-Neustart wird nur empfohlen, wenn ein neuerer als der laufende Kernel installiert ist; die Meldung nennt beide Versionen. Warnt explizit bei fehlendem DNF-Plugin.
 * **Desktop-Benachrichtigungen:** Sendet nach Abschluss eines echten Update-Durchlaufs eine native Systembenachrichtigung (ideal für KDE Plasma oder GNOME).
 
 ## 📋 Systemanforderungen
 
 * **Betriebssystem:** ausschließlich Fedora Linux (das Skript prüft `/etc/fedora-release` und bricht auf anderen Distributionen ab)
-* **Abhängigkeiten:** `bash`, `sudo`, `dnf`, `rpm`, `uname`, `sort`, `date` sowie `tee` bei Nutzung von `--log` (auf Fedora standardmäßig vorhanden)
+* **Abhängigkeiten:** `bash`, `sudo`, `dnf`, `rpm`, `uname`, `sort`, `date`, `tee`, `mktemp` und `rm` (auf Fedora standardmäßig vorhanden)
 * **Optional:** `flatpak` (für App-Updates), `snapd` (für Snap-Updates), `fwupd` (für Firmware-Updates), `libnotify` (für Desktop-Benachrichtigungen via `notify-send`)
 
 ## 🛠️ Installation
@@ -44,7 +46,7 @@ Ein robustes und automatisiertes Bash-Skript, um Fedora Linux effizient auf dem 
 
 | Parameter | Beschreibung |
 |---|---|
-| `--autoremove` | Entfernt nach den Updates nicht mehr benötigte Pakete (`dnf autoremove`) und ungenutzte Flatpak-Laufzeitumgebungen (`flatpak uninstall --unused`). Laufzeitumgebungen, die noch von einer App genutzt werden, bleiben erhalten. |
+| `--autoremove` | Entfernt nach den Updates nicht mehr benötigte Pakete (`dnf autoremove`) und ungenutzte Flatpak-Laufzeitumgebungen (`flatpak uninstall --unused`, systemweit über `sudo`). Laufzeitumgebungen, die noch von einer App genutzt werden, bleiben erhalten, auch veraltete (end-of-life) und auch solche, die nur eine App der Benutzerinstallation braucht. |
 | `--snap` | Aktiviert die Aktualisierung von Snap-Paketen (standardmäßig übersprungen, da Snap unter Fedora nicht vorinstalliert ist). |
 | `--firmware` | Spielt Firmware-Updates über fwupd ein (`fwupdmgr refresh`, `get-updates` und `update`). Gibt es keine Updates, ist das kein Fehler, und es wird nichts installiert. Ein Neustart wird nur empfohlen, wenn tatsächlich Firmware eingespielt wurde (viele UEFI-Updates werden erst beim nächsten Neustart installiert), aber nie automatisch ausgelöst. |
 | `--log <Dateipfad>` | Speichert die gesamte Terminalausgabe (inkl. Fehler) zusätzlich in der angegebenen Logdatei. Farben werden dabei deaktiviert. |
@@ -98,7 +100,9 @@ Ein empfohlener Neustart ändert den Exit-Code nicht, sondern wird nur in der Au
 | `Kann nicht in Logdatei schreiben: …` | Der Ordner existiert nicht oder ist nicht beschreibbar. Einen Pfad im eigenen Home-Verzeichnis wählen, z. B. `~/update.log`. |
 | `Neustartstatus unklar (…)` | Das `needs-restarting`-Plugin fehlt: `sudo dnf install dnf5-plugins` (unter dnf4: `python3-dnf-plugins-core`). |
 | `Snap ist zwar installiert, aber der snapd-Dienst ist nicht aktiv.` | Snap-Dienst aktivieren: `sudo systemctl enable --now snapd.socket` |
-| `Flatpak-Update meldete einen Fehler` | `flatpak update` von Hand ausführen, um die genaue Fehlermeldung zu sehen; mit `flatpak remotes` prüfen, ob die Quellen (z. B. Flathub) eingerichtet sind. |
+| `Flatpak-Update (system/user) meldete einen Fehler` | `sudo flatpak update --system` bzw. `flatpak update --user` von Hand ausführen, um die genaue Fehlermeldung zu sehen; mit `flatpak remotes` prüfen, ob die Quellen (z. B. Flathub) eingerichtet sind. |
+| `System-Neustart empfohlen (neuerer Kernel … installiert, es läuft noch …)` | Ein neuerer Kernel ist installiert, aber noch nicht gestartet, auch wenn DNF in diesem Lauf „Nichts zu tun“ meldete (z. B. aus einem früheren Update). Bleibt die Meldung nach einem Neustart, startet der Bootloader einen älteren Kernel: `sudo grubby --default-kernel` zeigt, welcher voreingestellt ist. |
+| `Hinweis: Veraltete Flatpak-Laufzeitumgebungen (end-of-life) werden noch genutzt …` | Nur ein Hinweis, kein Fehler. Die genannten Apps brauchen eine neuere Laufzeitumgebung, die nur ihre Entwickler liefern können. Die alte Laufzeitumgebung bleibt installiert, damit die Apps weiter starten. |
 | `Nicht alle Firmware-Updates wurden eingespielt` | fwupd hat ein Update übersprungen, meist weil es eine Benutzeraktion braucht (z. B. Netzteil anschließen, Akku laden). Die Ausgabe von fwupd nennt den Grund; danach das Skript erneut mit `--firmware` starten. |
 | `Firmware-Update meldete einen Fehler` | `fwupdmgr update` von Hand ausführen, um die genaue Fehlermeldung zu sehen; `fwupdmgr get-devices` zeigt, welche Geräte fwupd unterstützt. |
 
@@ -107,7 +111,7 @@ Ein empfohlener Neustart ändert den Exit-Code nicht, sondern wird nur in der Au
 ## ⚠️ Bekannte Einschränkungen
 
 * **dnf5 (Fedora 41+):** Seit Fedora 41 ist `dnf` ein Alias für `dnf5`. Die Neustart-Prüfung (`dnf needs-restarting -r`) benötigt dort das Paket `dnf5-plugins` (unter dnf4: `python3-dnf-plugins-core`). Unter dnf5 5.4 (Fedora 44) wird `-r` nur noch aus Kompatibilitätsgründen akzeptiert und hat keine eigene Wirkung, der Aufruf funktioniert also. Einen nötigen Neustart meldet `needs-restarting` mit Exit-Code 1; weil auch Fehler (z. B. ein fehlendes Plugin) mit 1 enden, prüft das Skript zusätzlich den Ausgabetext „Reboot is required“ (ohne Beachtung der Groß-/Kleinschreibung). Das Verhalten ist dem dnf5-Quelltext entnommen. Auf einem echten Fedora-44-System bestätigt ist bisher der Fall ohne nötigen Neustart; der Fall „Neustart nötig“ wurde dort noch nicht beobachtet.
-* **Flatpak:** `flatpak update` aktualisiert sowohl Benutzer- als auch systemweite Installationen. Bei systemweiten Installationen kann polkit nach einem Passwort fragen, z. B. bei einer SSH-Sitzung.
+* **Flatpak:** Die systemweite Installation wird mit `sudo flatpak … --system` bearbeitet, die Benutzerinstallation mit `flatpak … --user`. Damit flatpak beim Aufräumen als root trotzdem die Apps der eigenen Benutzerinstallation berücksichtigt, setzt das Skript `FLATPAK_USER_DIR` auf deren Pfad (`${XDG_DATA_HOME:-~/.local/share}/flatpak`). Die Fortschrittstabelle ist über `FLATPAK_FANCY_OUTPUT=0` abgeschaltet. Den EOL-Hinweis erkennt das Skript am Meldungstext von flatpak („is end-of-life“); übersetzt flatpak diesen Text künftig, entfällt nur der Hinweis.
 * **Desktop-Benachrichtigungen:** `notify-send` wird nur aufgerufen, wenn eine aktive Desktop-Session erkannt wird (`DBUS_SESSION_BUS_ADDRESS` gesetzt). Bei einer reinen SSH-Sitzung wird die Benachrichtigung übersprungen.
 
 ## 🧪 Entwicklung & Tests
