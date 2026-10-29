@@ -25,7 +25,7 @@ setup() {
     # Nur diese echten Werkzeuge stehen im PATH, damit lokal installierte
     # flatpak/snap/fwupdmgr/notify-send die Ergebnisse nicht beeinflussen.
     local tool
-    for tool in cat date env sleep sort tail tee touch uname; do
+    for tool in cat date env mktemp rm sleep sort tail tee touch uname; do
         ln -s "$(command -v "$tool")" "$MOCKBIN/$tool"
     done
 
@@ -116,12 +116,14 @@ not_called() {
     [ "$status" -eq 0 ]
     [[ "$output" == *"[DRY-RUN] Würde ausführen: sudo dnf upgrade --refresh -y"* ]]
     [[ "$output" == *"[DRY-RUN] Würde ausführen: sudo dnf autoremove -y"* ]]
-    [[ "$output" == *"[DRY-RUN] Würde ausführen: flatpak update -y"* ]]
-    [[ "$output" == *"[DRY-RUN] Würde ausführen: flatpak uninstall --unused -y"* ]]
+    [[ "$output" == *"[DRY-RUN] Würde ausführen: sudo env FLATPAK_FANCY_OUTPUT=0 FLATPAK_USER_DIR="*"flatpak update --system -y"* ]]
+    [[ "$output" == *"[DRY-RUN] Würde ausführen: sudo env FLATPAK_FANCY_OUTPUT=0 FLATPAK_USER_DIR="*"flatpak uninstall --system --unused -y"* ]]
     [[ "$output" == *"Dry-Run abgeschlossen"* ]]
     [[ "$output" != *"ohne Fehler ausgeführt"* ]]
     not_called "^sudo"
-    not_called "^flatpak"
+    # Nur das lesende 'flatpak list' ist im Dry-Run erlaubt
+    not_called "^flatpak update"
+    not_called "^flatpak uninstall"
     not_called "^notify-send"
 }
 
@@ -169,12 +171,81 @@ not_called() {
     [[ "$output" == *"Update mit Teilfehlern abgeschlossen (Flatpak)"* ]]
 }
 
+@test "Flatpak-Systeminstallation wird über sudo aktualisiert" {
+    mock flatpak
+    run_script
+    [ "$status" -eq 0 ]
+    grep -qx "sudo env FLATPAK_FANCY_OUTPUT=0 FLATPAK_USER_DIR=$HOME/.local/share/flatpak flatpak update --system -y" "$CALLS"
+    called "flatpak update --system -y"
+}
+
+@test "Flatpak zeichnet keine Fortschrittstabelle (FLATPAK_FANCY_OUTPUT=0)" {
+    mock flatpak 'echo "fancy $1=${FLATPAK_FANCY_OUTPUT:-}" >> "'"$CALLS"'"'
+    run_script --autoremove
+    [ "$status" -eq 0 ]
+    called "fancy update=0"
+    called "fancy uninstall=0"
+}
+
+@test "Flatpak-Benutzerinstallation wird nur aktualisiert, wenn dort etwas installiert ist" {
+    mock flatpak
+    run_script
+    [ "$status" -eq 0 ]
+    not_called "flatpak update --user"
+
+    : > "$CALLS"
+    mock flatpak '[[ "$1" == list && "$2" == --user ]] && echo app/org.example.App/x86_64/stable; exit 0'
+    run_script --autoremove
+    [ "$status" -eq 0 ]
+    called "flatpak update --user -y"
+    called "flatpak uninstall --user --unused -y"
+    # Die Benutzerinstallation braucht keine Adminrechte
+    not_called "^sudo .*--user"
+}
+
 @test "--autoremove entfernt ungenutzte Flatpak-Laufzeitumgebungen" {
     mock flatpak
     run_script --autoremove
     [ "$status" -eq 0 ]
-    called "flatpak update -y"
-    called "flatpak uninstall --unused -y"
+    called "flatpak update --system -y"
+    # FLATPAK_USER_DIR sorgt dafür, dass flatpak auch als root die Benutzer-Apps des Aufrufers berücksichtigt
+    grep -qx "sudo env FLATPAK_FANCY_OUTPUT=0 FLATPAK_USER_DIR=$HOME/.local/share/flatpak flatpak uninstall --system --unused -y" "$CALLS"
+}
+
+@test "Flatpak-Aufräumen beachtet XDG_DATA_HOME für die Benutzerinstallation" {
+    mock flatpak
+    run env -u DBUS_SESSION_BUS_ADDRESS XDG_DATA_HOME="$BATS_TEST_TMPDIR/data" PATH="$MOCKBIN" /bin/bash "$SCRIPT" --autoremove 3>&-
+    [ "$status" -eq 0 ]
+    grep -q "^sudo env FLATPAK_FANCY_OUTPUT=0 FLATPAK_USER_DIR=$BATS_TEST_TMPDIR/data/flatpak flatpak uninstall" "$CALLS"
+}
+
+@test "genutzte EOL-Laufzeitumgebung wird nicht entfernt, nur erwähnt" {
+    mock flatpak 'if [[ "$1" == update ]]; then
+cat <<OUT
+Info: runtime org.freedesktop.Platform branch 24.08 is end-of-life, with reason:
+   org.freedesktop.Platform 24.08 is no longer receiving fixes and security updates.
+Info: applications using this runtime:
+   org.processing.pde
+
+Info: runtime org.freedesktop.Platform.GL.default branch 24.08 is end-of-life, with reason:
+   org.freedesktop.Platform 24.08 is no longer receiving fixes and security updates.
+Info: applications using this extension:
+   org.processing.pde
+OUT
+fi'
+    run_script --autoremove
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Hinweis: Veraltete Flatpak-Laufzeitumgebungen (end-of-life) werden noch genutzt und bleiben daher installiert. Betroffene Apps: org.processing.pde."* ]]
+    # Nur 'uninstall --unused', nie ein gezieltes Entfernen der EOL-Laufzeitumgebung
+    not_called "^flatpak uninstall .*org.freedesktop"
+    [ "$(grep -c '^flatpak uninstall' "$CALLS")" -eq 1 ]
+}
+
+@test "ohne EOL-Meldung von flatpak gibt es keinen EOL-Hinweis" {
+    mock flatpak
+    run_script
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"end-of-life"* ]]
 }
 
 @test "ohne --autoremove bleiben Flatpak-Laufzeitumgebungen unangetastet" {
@@ -308,11 +379,21 @@ esac'
 
 # --- Neustart-Prüfung ------------------------------------------------------
 
-@test "neuer Kernel führt zur Neustart-Empfehlung" {
+@test "neuerer installierter Kernel führt zur Neustart-Empfehlung mit beiden Versionen" {
+    export MOCK_KERNEL="999.0.1-1.fc99.x86_64"
+    run_script
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Neustart empfohlen (neuerer Kernel 999.0.1-1.fc99.x86_64 installiert, es läuft noch $(uname -r))"* ]]
+    not_called "needs-restarting"
+}
+
+@test "älterer installierter Kernel ist kein Grund für einen Neustart" {
     export MOCK_KERNEL="0.0.1-1.fc99.x86_64"
     run_script
     [ "$status" -eq 0 ]
-    [[ "$output" == *"Neustart empfohlen (Neuer Kernel installiert)"* ]]
+    [[ "$output" != *"neuerer Kernel"* ]]
+    called "sudo env LC_ALL=C dnf needs-restarting -r"
+    [[ "$output" == *"Kein Neustart erforderlich"* ]]
 }
 
 @test "laufender Kernel ist aktuell, needs-restarting entscheidet" {
