@@ -42,7 +42,7 @@ mock() {
 }
 
 run_script() {
-    run env -u DBUS_SESSION_BUS_ADDRESS -u NO_COLOR PATH="$MOCKBIN" /bin/bash "$SCRIPT" "$@" 3>&-
+    run env -u DBUS_SESSION_BUS_ADDRESS -u NO_COLOR -u XDG_DATA_DIRS PATH="$MOCKBIN" /bin/bash "$SCRIPT" "$@" 3>&-
 }
 
 called() {
@@ -175,7 +175,7 @@ not_called() {
     mock flatpak
     run_script
     [ "$status" -eq 0 ]
-    grep -qx "sudo env FLATPAK_FANCY_OUTPUT=0 FLATPAK_USER_DIR=$HOME/.local/share/flatpak flatpak update --system -y" "$CALLS"
+    grep -qx "sudo env FLATPAK_FANCY_OUTPUT=0 FLATPAK_USER_DIR=$HOME/.local/share/flatpak XDG_DATA_DIRS=/var/lib/flatpak/exports/share:/usr/local/share:/usr/share flatpak update --system -y" "$CALLS"
     called "flatpak update --system -y"
 }
 
@@ -209,14 +209,14 @@ not_called() {
     [ "$status" -eq 0 ]
     called "flatpak update --system -y"
     # FLATPAK_USER_DIR sorgt dafür, dass flatpak auch als root die Benutzer-Apps des Aufrufers berücksichtigt
-    grep -qx "sudo env FLATPAK_FANCY_OUTPUT=0 FLATPAK_USER_DIR=$HOME/.local/share/flatpak flatpak uninstall --system --unused -y" "$CALLS"
+    grep -qx "sudo env FLATPAK_FANCY_OUTPUT=0 FLATPAK_USER_DIR=$HOME/.local/share/flatpak XDG_DATA_DIRS=/var/lib/flatpak/exports/share:/usr/local/share:/usr/share flatpak uninstall --system --unused -y" "$CALLS"
 }
 
 @test "Flatpak-Aufräumen beachtet XDG_DATA_HOME für die Benutzerinstallation" {
     mock flatpak
-    run env -u DBUS_SESSION_BUS_ADDRESS XDG_DATA_HOME="$BATS_TEST_TMPDIR/data" PATH="$MOCKBIN" /bin/bash "$SCRIPT" --autoremove 3>&-
+    run env -u DBUS_SESSION_BUS_ADDRESS -u XDG_DATA_DIRS XDG_DATA_HOME="$BATS_TEST_TMPDIR/data" PATH="$MOCKBIN" /bin/bash "$SCRIPT" --autoremove 3>&-
     [ "$status" -eq 0 ]
-    grep -q "^sudo env FLATPAK_FANCY_OUTPUT=0 FLATPAK_USER_DIR=$BATS_TEST_TMPDIR/data/flatpak flatpak uninstall" "$CALLS"
+    grep -q "^sudo env FLATPAK_FANCY_OUTPUT=0 FLATPAK_USER_DIR=$BATS_TEST_TMPDIR/data/flatpak XDG_DATA_DIRS=/var/lib/flatpak/exports/share:/usr/local/share:/usr/share flatpak uninstall" "$CALLS"
 }
 
 @test "genutzte EOL-Laufzeitumgebung wird nicht entfernt, nur erwähnt" {
@@ -260,6 +260,52 @@ fi'
     run_script --autoremove
     [ "$status" -eq 1 ]
     [[ "$output" == *"Update mit Teilfehlern abgeschlossen (Flatpak-Aufräumen)"* ]]
+}
+
+@test "Flatpak-Fortschrittszeilen nennen die ID des gerade aktualisierten Eintrags" {
+    mock flatpak 'if [[ "$1" == update ]]; then
+cat <<OUT
+Suche nach Aktualisierungen …
+
+
+        ID                                  Zweig    Op   Entfernte Quelle   Herunterladen
+ 1.     org.freedesktop.Platform.GL.default 25.08    u    flathub            < 150,2 MB
+ 2.     org.mozilla.firefox                 stable   u    flathub            < 98,1 MB
+
+
+Aktualisiere 1/2 …
+Aktualisiere 1/2 …  ██████              30%  3,3 MB/s  00:12
+Aktualisiere 2/2 …
+Aktualisiere 2/2 …  ████████████████████ 100%  4,2 MB/s  00:00
+Updating 2/2…
+Aktualisiere 3/2 …
+OUT
+fi'
+    run_script
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Aktualisiere 1/2 org.freedesktop.Platform.GL.default …"$'\n'* ]]
+    [[ "$output" == *"Aktualisiere 1/2 org.freedesktop.Platform.GL.default …  ██████              30%  3,3 MB/s  00:12"* ]]
+    [[ "$output" == *"Aktualisiere 2/2 org.mozilla.firefox …  ████████████████████ 100%"* ]]
+    # Englische Ausgabe (ohne Leerzeichen vor dem "…") wird ebenso ergänzt
+    [[ "$output" == *"Updating 2/2 org.mozilla.firefox…"* ]]
+    # Die Tabelle bleibt unverändert, unbekannte Nummern ebenso
+    [[ "$output" == *" 2.     org.mozilla.firefox                 stable   u    flathub            < 98,1 MB"* ]]
+    [[ "$output" == *"Aktualisiere 3/2 …"* ]]
+}
+
+@test "XDG_DATA_DIRS des Aufrufers wird an flatpak über sudo weitergegeben" {
+    mock flatpak
+    # Bereits enthalten: unverändert weitergeben
+    run env -u DBUS_SESSION_BUS_ADDRESS XDG_DATA_DIRS=/home/x/.local/share/flatpak/exports/share:/var/lib/flatpak/exports/share:/usr/share \
+        PATH="$MOCKBIN" /bin/bash "$SCRIPT" 3>&-
+    [ "$status" -eq 0 ]
+    grep -q "^sudo env .* XDG_DATA_DIRS=/home/x/.local/share/flatpak/exports/share:/var/lib/flatpak/exports/share:/usr/share flatpak update --system -y$" "$CALLS"
+
+    # Fehlt das Exportverzeichnis, wird es vorangestellt
+    : > "$CALLS"
+    run env -u DBUS_SESSION_BUS_ADDRESS XDG_DATA_DIRS=/usr/share PATH="$MOCKBIN" /bin/bash "$SCRIPT" 3>&-
+    [ "$status" -eq 0 ]
+    grep -q "^sudo env .* XDG_DATA_DIRS=/var/lib/flatpak/exports/share:/usr/share flatpak update --system -y$" "$CALLS"
 }
 
 @test "fehlendes Flatpak ist nur ein Hinweis" {
