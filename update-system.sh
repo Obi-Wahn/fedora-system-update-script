@@ -153,7 +153,7 @@ fi
 # shellcheck disable=SC2154  # err_code wird im Trap-String selbst gesetzt
 trap 'err_code=$?; error "Fehler in Zeile $LINENO (Code $err_code): $BASH_COMMAND"; error "Update abgebrochen."; exit $err_code' ERR
 
-# shellcheck disable=SC2317  # wird indirekt über 'trap cleanup EXIT' aufgerufen
+# shellcheck disable=SC2317,SC2329  # wird indirekt über 'trap cleanup EXIT' aufgerufen
 cleanup() {
     if [[ -n "${SUDO_KEEPALIVE_PID:-}" ]]; then
         kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
