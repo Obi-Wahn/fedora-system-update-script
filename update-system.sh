@@ -153,7 +153,7 @@ fi
 # shellcheck disable=SC2154  # err_code wird im Trap-String selbst gesetzt
 trap 'err_code=$?; error "Fehler in Zeile $LINENO (Code $err_code): $BASH_COMMAND"; error "Update abgebrochen."; exit $err_code' ERR
 
-# shellcheck disable=SC2317  # wird indirekt über 'trap cleanup EXIT' aufgerufen
+# shellcheck disable=SC2317,SC2329  # wird indirekt über 'trap cleanup EXIT' aufgerufen
 cleanup() {
     if [[ -n "${SUDO_KEEPALIVE_PID:-}" ]]; then
         kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
@@ -199,8 +199,28 @@ else
     info "DNF 'autoremove' ist nicht aktiviert (nutze --autoremove). Übersprungen."
 fi
 
+# Ergänzt die Fortschrittszeilen von flatpak ("Aktualisiere 9/16 …") um die ID des gerade bearbeiteten Eintrags.
+# flatpak gibt vor dem Start eine nummerierte Tabelle aus (" 9.     org.example.App  stable  u  flathub  < 12 MB");
+# die Nummer in der Fortschrittszeile verweist auf diese Tabellenzeile. Alle übrigen Zeilen bleiben unverändert.
+# Das Muster hängt nur an "<Nummer>/<Anzahl> …", nicht am (übersetzten) Text davor.
+flatpak_annotate() {
+    local line
+    local -A ids=()
+    local row_re='^[[:space:]]*([0-9]+)\.[[:space:]]+([^[:space:]]+)'
+    local progress_re='^(.*[^0-9])([0-9]+)/([0-9]+)( ?…)(.*)$'
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ $row_re ]]; then
+            ids[${BASH_REMATCH[1]}]=${BASH_REMATCH[2]}
+        elif [[ "$line" =~ $progress_re ]] && [[ -n "${ids[${BASH_REMATCH[2]}]:-}" ]]; then
+            line="${BASH_REMATCH[1]}${BASH_REMATCH[2]}/${BASH_REMATCH[3]} ${ids[${BASH_REMATCH[2]}]}${BASH_REMATCH[4]}${BASH_REMATCH[5]}"
+        fi
+        printf '%s\n' "$line"
+    done
+}
+
 # Führt einen flatpak-Befehl für eine Installation ('system' oder 'user') aus: flatpak_step <scope> <befehl> [args...]
-# Die Ausgabe erscheint wie gewohnt und wird zusätzlich in FLATPAK_OUTPUT_FILE gesammelt (für den EOL-Hinweis).
+# Die Ausgabe erscheint wie gewohnt (Fortschrittszeilen ergänzt um die Flatpak-ID, siehe flatpak_annotate) und wird
+# zusätzlich in FLATPAK_OUTPUT_FILE gesammelt (für den EOL-Hinweis).
 # - FLATPAK_FANCY_OUTPUT=0 schaltet die sich ständig neu zeichnende Fortschrittstabelle ab, die bei vielen
 #   Updates oder schmalem Terminal zu unlesbaren Zeilen führt.
 # - Die systemweite Installation läuft über sudo. Ohne Rechte entscheidet polkit, und das verweigert z.B.
@@ -208,14 +228,17 @@ fi
 # - FLATPAK_USER_DIR zeigt dabei auf die Benutzerinstallation des Aufrufers. flatpak berücksichtigt so beim
 #   Aufräumen weiterhin Benutzer-Apps, die Laufzeitumgebungen der Systeminstallation nutzen (sonst sähe es nur
 #   die Benutzerinstallation von root).
+# - XDG_DATA_DIRS geht über sudo sonst verloren. Dann meldet update-mime-database (von flatpak nach dem Update
+#   aufgerufen), '/var/lib/flatpak/exports/share' liege nicht im Suchpfad. Daher wird der Wert des Aufrufers
+#   weitergegeben, bei Bedarf um dieses Verzeichnis ergänzt.
 flatpak_step() {
     local scope=$1 cmd=$2
     shift 2
     if [[ "$scope" == "system" ]]; then
-        run_step sudo env FLATPAK_FANCY_OUTPUT=0 FLATPAK_USER_DIR="$FLATPAK_USER_DIR" \
-            flatpak "$cmd" --system "$@" 2>&1 | tee -a "$FLATPAK_OUTPUT_FILE"
+        run_step sudo env FLATPAK_FANCY_OUTPUT=0 FLATPAK_USER_DIR="$FLATPAK_USER_DIR" XDG_DATA_DIRS="$FLATPAK_XDG_DATA_DIRS" \
+            flatpak "$cmd" --system "$@" 2>&1 | flatpak_annotate | tee -a "$FLATPAK_OUTPUT_FILE"
     else
-        run_step env FLATPAK_FANCY_OUTPUT=0 flatpak "$cmd" --user "$@" 2>&1 | tee -a "$FLATPAK_OUTPUT_FILE"
+        run_step env FLATPAK_FANCY_OUTPUT=0 flatpak "$cmd" --user "$@" 2>&1 | flatpak_annotate | tee -a "$FLATPAK_OUTPUT_FILE"
     fi
 }
 
@@ -246,6 +269,11 @@ printf '\n'
 info "Starte Flatpak-Updates..."
 if command -v flatpak &>/dev/null; then
     FLATPAK_USER_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/flatpak"
+    FLATPAK_XDG_DATA_DIRS="${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+    if [[ ":$FLATPAK_XDG_DATA_DIRS:" != *":/var/lib/flatpak/exports/share:"* \
+        && ":$FLATPAK_XDG_DATA_DIRS:" != *":/var/lib/flatpak/exports/share/:"* ]]; then
+        FLATPAK_XDG_DATA_DIRS="/var/lib/flatpak/exports/share:$FLATPAK_XDG_DATA_DIRS"
+    fi
     FLATPAK_OUTPUT_FILE=$(mktemp)
     # Die Benutzerinstallation nur anfassen, wenn dort etwas installiert ist
     FLATPAK_SCOPES=(system)
