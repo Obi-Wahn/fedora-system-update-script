@@ -31,6 +31,7 @@ setup() {
 
     mock sudo '[[ "$1" == -v || "$1" == -n ]] && exit 0; exec "$@"'
     mock dnf 'if [[ "$1" == needs-restarting ]]; then echo "${MOCK_NEEDS_RESTARTING_OUTPUT:-}"; exit "${MOCK_NEEDS_RESTARTING_RC:-0}"; fi
+if [[ "$1" == upgrade && " $* " == *" --assumeno "* ]]; then [[ -n "${MOCK_DNF_PREVIEW_OUTPUT:-}" ]] && cat "$MOCK_DNF_PREVIEW_OUTPUT"; exit "${MOCK_DNF_PREVIEW_RC:-0}"; fi
 [[ "$1" == upgrade && -n "${MOCK_DNF_UPGRADE_OUTPUT:-}" ]] && cat "$MOCK_DNF_UPGRADE_OUTPUT"; exit 0'
     mock rpm '[[ -n "${MOCK_KERNEL:-}" ]] || exit 1; [[ "$*" == *--queryformat* ]] && echo "$MOCK_KERNEL"; exit 0'
 }
@@ -115,7 +116,8 @@ not_called() {
     run env -u NO_COLOR DBUS_SESSION_BUS_ADDRESS=unix:path=/dev/null PATH="$MOCKBIN" \
         /bin/bash "$SCRIPT" --dry-run --autoremove 3>&-
     [ "$status" -eq 0 ]
-    [[ "$output" == *"[DRY-RUN] Würde ausführen: sudo dnf upgrade --refresh -y"* ]]
+    [[ "$output" == *"[DRY-RUN] Würde ausführen: sudo env LC_ALL=C dnf upgrade --refresh --assumeno"* ]]
+    [[ "$output" == *"[DRY-RUN] Würde ausführen: sudo dnf upgrade -y"* ]]
     [[ "$output" == *"[DRY-RUN] Würde ausführen: sudo dnf autoremove -y"* ]]
     [[ "$output" == *"[DRY-RUN] Würde ausführen: sudo env FLATPAK_FANCY_OUTPUT=0 FLATPAK_USER_DIR="*"flatpak update --system -y"* ]]
     [[ "$output" == *"[DRY-RUN] Würde ausführen: sudo env FLATPAK_FANCY_OUTPUT=0 FLATPAK_USER_DIR="*"flatpak uninstall --system --unused -y"* ]]
@@ -134,7 +136,9 @@ not_called() {
     run_script
     [ "$status" -eq 0 ]
     called "sudo -v"
-    called "sudo dnf upgrade --refresh -y"
+    called "sudo env LC_ALL=C dnf upgrade --refresh --assumeno"
+    called "sudo dnf upgrade -y"
+    [[ "$output" == *"Vorabprüfung ohne kritische Befunde"* ]]
     not_called "autoremove"
     [[ "$output" == *"Alle vorgesehenen Update-Schritte wurden ohne Fehler ausgeführt"* ]]
     [[ "$output" == *"Kein Neustart erforderlich"* ]]
@@ -498,6 +502,146 @@ EOF
     [ "$status" -eq 0 ]
     [[ "$output" != *"übersprungen:"* ]]
     [[ "$output" == *"ohne Fehler ausgeführt"* ]]
+}
+
+# --- Vorabprüfung und Rückfrage bei kritischen DNF-Befunden ---------------
+
+# Vorschau (LC_ALL=C, --assumeno) wie im Fall von libplasma: Plasma würde nur teilweise aktualisiert
+write_dnf_preview_partial_plasma() {
+    export MOCK_DNF_PREVIEW_OUTPUT="$BATS_TEST_TMPDIR/dnf-preview.txt"
+    export MOCK_DNF_PREVIEW_RC=1
+    cat > "$MOCK_DNF_PREVIEW_OUTPUT" <<'EOF'
+Repositories loaded.
+Problem: installed package plasma-applet-appgrid-1.9.6-1.fc44.x86_64 requires libPlasma.so.7()(64bit), but none of the providers can be installed
+  - package plasma-applet-appgrid-1.9.6-1.fc44.x86_64 from copr:copr.fedorainfracloud.org:scujas:plasma-applet-appgrid requires libPlasma.so.7()(64bit), but none of the providers can be installed
+Package                  Arch    Version         Repository      Size
+Upgrading:
+ plasma-workspace        x86_64  6.8.2-1.fc44    updates     12.0 MiB
+   replacing plasma-workspace x86_64 6.7.5-1.fc44 updates    11.9 MiB
+Skipping packages with conflicts:
+ libplasma               x86_64  6.8.2-1.fc44    updates      6.8 MiB
+
+Transaction Summary:
+ Upgrading:          1 package
+ Replacing:          1 package
+ Skipping:           1 package
+
+Total size of inbound packages is 12 MiB. Need to download 12 MiB.
+After this operation, 100 KiB extra will be used (install 12 MiB, remove 11.9 MiB).
+Operation aborted by the user.
+EOF
+}
+
+@test "Vorabprüfung: übersprungenes Kernpaket ohne Terminal bricht das DNF-Update sicher ab" {
+    write_dnf_preview_partial_plasma
+    mock flatpak
+    run_script --autoremove
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"kritische Punkte gefunden"* ]]
+    [[ "$output" == *"Teil-Update von Kernpaketen: DNF würde diese Updates überspringen, den Rest aber einspielen: libplasma."* ]]
+    [[ "$output" == *"Ursache: plasma-applet-appgrid (copr:copr.fedorainfracloud.org:scujas:plasma-applet-appgrid)"* ]]
+    [[ "$output" == *"Keine Rückfrage möglich"* ]]
+    [[ "$output" == *"Update mit Teilfehlern abgeschlossen (DNF-Update nicht ausgeführt)"* ]]
+    [[ "$output" == *"Das DNF-Update wurde wegen kritischer Befunde der Vorabprüfung nicht ausgeführt"* ]]
+    # Die Vorschau von DNF wird angezeigt
+    [[ "$output" == *"Skipping packages with conflicts:"* ]]
+    not_called "sudo dnf upgrade -y"
+    not_called "autoremove"
+    # Die übrigen Schritte laufen weiter
+    called "flatpak update --system -y"
+}
+
+@test "Vorabprüfung: --yes führt das DNF-Update trotz kritischer Befunde aus" {
+    write_dnf_preview_partial_plasma
+    run_script --yes
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"kritische Punkte gefunden"* ]]
+    [[ "$output" == *"Fahre trotzdem fort (--yes)"* ]]
+    called "sudo dnf upgrade -y"
+}
+
+@test "Vorabprüfung: Rückfrage im Terminal, 'n' überspringt und 'j' führt das DNF-Update aus" {
+    command -v script >/dev/null || skip "'script' (util-linux) ist nicht installiert"
+    write_dnf_preview_partial_plasma
+
+    run bash -c "printf 'n\n' | script -qec \"env -u DBUS_SESSION_BUS_ADDRESS PATH='$MOCKBIN' /bin/bash '$SCRIPT'\" /dev/null" 3>&-
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Trotzdem mit dem DNF-Update fortfahren? [j/N]"* ]]
+    [[ "$output" == *"DNF-Update auf Wunsch übersprungen"* ]]
+    not_called "sudo dnf upgrade -y"
+
+    run bash -c "printf 'j\n' | script -qec \"env -u DBUS_SESSION_BUS_ADDRESS PATH='$MOCKBIN' /bin/bash '$SCRIPT'\" /dev/null" 3>&-
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Trotzdem mit dem DNF-Update fortfahren? [j/N]"* ]]
+    called "sudo dnf upgrade -y"
+}
+
+@test "Vorabprüfung: übersprungene Pakete außerhalb der Kernpakete lösen keine Rückfrage aus" {
+    export MOCK_DNF_PREVIEW_OUTPUT="$BATS_TEST_TMPDIR/dnf-preview.txt"
+    cat > "$MOCK_DNF_PREVIEW_OUTPUT" <<'EOF'
+Problem: installed package libheif-freeworld-1.23.6-1.fc44.x86_64 requires libheif(x86-64) = 1.23.6, but none of the providers can be installed
+Package                  Arch    Version         Repository      Size
+Skipping packages with conflicts:
+ libheif                 x86_64  1.23.7-1.fc44   updates      2.4 MiB
+
+Nothing to do.
+EOF
+    run_script
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"kritische Punkte"* ]]
+    [[ "$output" == *"Vorabprüfung ohne kritische Befunde"* ]]
+    called "sudo dnf upgrade -y"
+}
+
+@test "Vorabprüfung: Entfernen und Herabstufen von Paketen gelten als kritisch" {
+    export MOCK_DNF_PREVIEW_OUTPUT="$BATS_TEST_TMPDIR/dnf-preview.txt"
+    export MOCK_DNF_PREVIEW_RC=1
+    cat > "$MOCK_DNF_PREVIEW_OUTPUT" <<'EOF'
+Package                  Arch    Version         Repository      Size
+Upgrading:
+ foo                     x86_64  2.0-1.fc44      updates      1.0 MiB
+   replacing foo         x86_64  1.0-1.fc44      updates      1.0 MiB
+Removing:
+ old-tool                x86_64  1.0-1.fc44      @System      1.0 MiB
+Removing dependent packages:
+ old-plugin              x86_64  1.0-1.fc44      @System      1.0 MiB
+Downgrading:
+ bar                     x86_64  0.9-1.fc44      updates      1.0 MiB
+   replacing bar         x86_64  1.0-1.fc44      updates      1.0 MiB
+
+Transaction Summary:
+ Upgrading:          1 package
+ Removing:           2 packages
+ Downgrading:        1 package
+Operation aborted by the user.
+EOF
+    run_script
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"DNF würde Pakete entfernen: old-tool, old-plugin."* ]]
+    [[ "$output" == *"DNF würde Pakete auf eine ältere Version herabstufen: bar."* ]]
+    [[ "$output" != *"Teil-Update von Kernpaketen"* ]]
+    not_called "sudo dnf upgrade -y"
+}
+
+@test "Vorabprüfung: Fehler von DNF gilt als kritisch" {
+    export MOCK_DNF_PREVIEW_OUTPUT="$BATS_TEST_TMPDIR/dnf-preview.txt"
+    export MOCK_DNF_PREVIEW_RC=1
+    echo "Failed to download metadata for repo 'updates'" > "$MOCK_DNF_PREVIEW_OUTPUT"
+    run_script
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Die Vorabprüfung von DNF ist fehlgeschlagen (Code 1)"* ]]
+    [[ "$output" == *"Failed to download metadata"* ]]
+    not_called "sudo dnf upgrade -y"
+}
+
+@test "Vorabprüfung: Abbruch durch --assumeno ohne Befunde ist kein Fehler" {
+    export MOCK_DNF_PREVIEW_OUTPUT="$BATS_TEST_TMPDIR/dnf-preview.txt"
+    export MOCK_DNF_PREVIEW_RC=1
+    printf 'Upgrading:\n foo x86_64 2.0-1.fc44 updates 1.0 MiB\nOperation aborted.\n' > "$MOCK_DNF_PREVIEW_OUTPUT"
+    run_script
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Vorabprüfung ohne kritische Befunde"* ]]
+    called "sudo dnf upgrade -y"
 }
 
 # --- Neustart-Prüfung ------------------------------------------------------
