@@ -30,7 +30,8 @@ setup() {
     done
 
     mock sudo '[[ "$1" == -v || "$1" == -n ]] && exit 0; exec "$@"'
-    mock dnf 'if [[ "$1" == needs-restarting ]]; then echo "${MOCK_NEEDS_RESTARTING_OUTPUT:-}"; exit "${MOCK_NEEDS_RESTARTING_RC:-0}"; fi'
+    mock dnf 'if [[ "$1" == needs-restarting ]]; then echo "${MOCK_NEEDS_RESTARTING_OUTPUT:-}"; exit "${MOCK_NEEDS_RESTARTING_RC:-0}"; fi
+[[ "$1" == upgrade && -n "${MOCK_DNF_UPGRADE_OUTPUT:-}" ]] && cat "$MOCK_DNF_UPGRADE_OUTPUT"; exit 0'
     mock rpm '[[ -n "${MOCK_KERNEL:-}" ]] || exit 1; [[ "$*" == *--queryformat* ]] && echo "$MOCK_KERNEL"; exit 0'
 }
 
@@ -423,6 +424,82 @@ esac'
     not_called "^fwupdmgr"
 }
 
+# --- Von DNF übersprungene Pakete -----------------------------------------
+
+# Gekürzte echte Ausgabe von dnf5 (Fedora 44) mit zwei Konflikten aus Fremdquellen
+write_dnf_conflict_output() {
+    export MOCK_DNF_UPGRADE_OUTPUT="$BATS_TEST_TMPDIR/dnf-upgrade.txt"
+    cat > "$MOCK_DNF_UPGRADE_OUTPUT" <<'EOF'
+Paketquellen geladen.
+Problem 1: installiertes Paket libheif-freeworld-1.23.6-1.fc44.x86_64 benötigt libheif(x86-64) = 1.23.6, aber keiner der Anbieter kann installiert werden
+  - libheif-1.23.7-1.fc44.x86_64 kann aus updates und libheif-1.23.6-1.fc44.x86_64 aus @System nicht zusammen installiert werden
+Problem 2: installiertes Paket plasma-applet-appgrid-1.9.6-1.fc44.x86_64 benötigt libPlasma.so.7()(64bit), aber keiner der Anbieter kann installiert werden
+  - libplasma-6.8.2-1.fc44.x86_64 kann aus updates und libplasma-6.7.5-1.fc44.x86_64 aus @System nicht zusammen installiert werden
+Problem 3: Problem mit installiertem Paket
+  - installiertes Paket plasma-applet-appgrid-1.9.6-1.fc44.x86_64 benötigt libPlasma.so.7()(64bit), aber keiner der Anbieter kann installiert werden
+  - Paket plasma-applet-appgrid-1.9.6-1.fc44.x86_64 aus copr:copr.fedorainfracloud.org:scujas:plasma-applet-appgrid benötigt libPlasma.so.7()(64bit), aber keiner der Anbieter kann installiert werden
+  - Paket bluedevil-6.8.2-1.fc44.x86_64 aus updates benötigt libPlasma.so.8()(64bit), aber keiner der Anbieter kann installiert werden
+Problem 4: Problem mit installiertem Paket
+  - installiertes Paket libheif-freeworld-1.23.6-1.fc44.x86_64 benötigt libheif(x86-64) = 1.23.6, aber keiner der Anbieter kann installiert werden
+  - Paket libheif-freeworld-1.23.6-1.fc44.x86_64 aus rpmfusion-free-updates benötigt libheif(x86-64) = 1.23.6, aber keiner der Anbieter kann installiert werden
+  - Paket libheif-freeworld-1.21.2-3.fc44.x86_64 aus rpmfusion-free benötigt libheif(x86-64) = 1.21.2, aber keiner der Anbieter kann installiert werden
+
+Paket                                                   Architektur Version                                                 Paketquelle                                                Größe
+Pakete mit Konflikten werden übersprungen:
+ libheif                                                x86_64      1.23.7-1.fc44                                           updates                                                  2.4 MiB
+ libheif-ffmpeg                                         x86_64      1.23.7-1.fc44                                           updates                                                 32.0 KiB
+ libplasma                                              x86_64      6.8.2-1.fc44                                            updates                                                  6.8 MiB
+ libheif                                                x86_64      1.21.2-1.fc44                                           fedora                                                   1.8 MiB
+Pakete mit nicht auflösbaren Abhängigkeiten werden übersprungen:
+ bluedevil                                              x86_64      6.8.2-1.fc44                                            updates                                                  2.7 MiB
+ libheif-freeworld                                      x86_64      1.21.2-3.fc44                                           rpmfusion-free                                         185.7 KiB
+ plasma-applet-appgrid                                  x86_64      1.7.10-1.fc44                                           copr:copr.fedorainfracloud.org:scujas:plasma-applet-ap   1.3 MiB
+
+Nichts zu tun.
+EOF
+}
+
+@test "von DNF übersprungene Pakete ergeben Warnung samt Verursacher und Exit-Code 1" {
+    write_dnf_conflict_output
+    run_script
+    [ "$status" -eq 1 ]
+    [[ "$output" != *"ohne Fehler ausgeführt"* ]]
+    [[ "$output" == *"Update mit Teilfehlern abgeschlossen (DNF-Konflikte)"* ]]
+    [[ "$output" == *"DNF hat Updates wegen Abhängigkeitskonflikten übersprungen: libheif, libheif-ffmpeg, libplasma, bluedevil."* ]]
+    [[ "$output" == *"Ursache: Diese installierten Pakete setzen noch die alten Versionen voraus: libheif-freeworld (rpmfusion-free-updates), plasma-applet-appgrid (copr:copr.fedorainfracloud.org:scujas:plasma-applet-appgrid)."* ]]
+    # Die DNF-Ausgabe selbst bleibt sichtbar
+    [[ "$output" == *"Nichts zu tun."* ]]
+}
+
+@test "englische DNF-Ausgabe (dnf4) wird ebenfalls erkannt" {
+    export MOCK_DNF_UPGRADE_OUTPUT="$BATS_TEST_TMPDIR/dnf-upgrade.txt"
+    cat > "$MOCK_DNF_UPGRADE_OUTPUT" <<'EOF'
+ Problem: installed package foo-ext-1.0-1.fc44.x86_64 requires foo = 1.0, but none of the providers can be installed
+  - package foo-ext-1.0-1.fc44.x86_64 from thirdparty requires foo = 1.0, but none of the providers can be installed
+================================================================================
+ Package          Arch          Version             Repository          Size
+================================================================================
+Skipping packages with conflicts:
+(add '--best --allowerasing' to command line to force their upgrade):
+ foo              x86_64        2.0-1.fc44          updates             1.0 M
+
+Nothing to do.
+EOF
+    run_script
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"übersprungen: foo."* ]]
+    [[ "$output" == *"voraus: foo-ext (thirdparty)."* ]]
+}
+
+@test "ohne übersprungene Pakete gibt es keine DNF-Warnung" {
+    export MOCK_DNF_UPGRADE_OUTPUT="$BATS_TEST_TMPDIR/dnf-upgrade.txt"
+    printf 'Paketquellen geladen.\nNichts zu tun.\n' > "$MOCK_DNF_UPGRADE_OUTPUT"
+    run_script
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"übersprungen:"* ]]
+    [[ "$output" == *"ohne Fehler ausgeführt"* ]]
+}
+
 # --- Neustart-Prüfung ------------------------------------------------------
 
 @test "neuerer installierter Kernel führt zur Neustart-Empfehlung mit beiden Versionen" {
@@ -456,7 +533,7 @@ esac'
     export MOCK_NEEDS_RESTARTING_OUTPUT="Reboot is required to fully utilize these updates."
     run_script
     [ "$status" -eq 0 ]
-    [[ "$output" == *"Neustart empfohlen (Systemkomponenten aktualisiert)"* ]]
+    [[ "$output" == *"Neustart empfohlen (Systemkomponenten wurden seit dem letzten Systemstart aktualisiert)"* ]]
 }
 
 @test "needs-restarting-Hinweistext wird unabhängig von Groß-/Kleinschreibung erkannt" {
@@ -464,7 +541,7 @@ esac'
     export MOCK_NEEDS_RESTARTING_OUTPUT="REBOOT IS REQUIRED to fully utilize these updates."
     run_script
     [ "$status" -eq 0 ]
-    [[ "$output" == *"Neustart empfohlen (Systemkomponenten aktualisiert)"* ]]
+    [[ "$output" == *"Neustart empfohlen (Systemkomponenten wurden seit dem letzten Systemstart aktualisiert)"* ]]
 }
 
 @test "needs-restarting mit Code 1, aber Fehlermeldung, gilt als unklar" {
@@ -481,4 +558,12 @@ esac'
     run_script
     [ "$status" -eq 0 ]
     [[ "$output" == *"Neustartstatus unklar"* ]]
+}
+
+@test "needs-restarting: aufgelistete Pakete werden in der Neustart-Empfehlung genannt" {
+    export MOCK_NEEDS_RESTARTING_RC=1
+    export MOCK_NEEDS_RESTARTING_OUTPUT=$'Core libraries or services have been updated since boot-up:\n  * glibc\n  * systemd\n\nReboot is required to fully utilize these updates.'
+    run_script
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Neustart empfohlen (seit dem letzten Systemstart aktualisiert: glibc, systemd)"* ]]
 }
