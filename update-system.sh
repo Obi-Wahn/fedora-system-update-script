@@ -14,7 +14,17 @@ RUN_AUTOREMOVE="false"
 RUN_SNAP_UPDATE="false"
 RUN_FIRMWARE_UPDATE="false"
 DRY_RUN="false"
+ASSUME_YES="false"
 LOGFILE=""
+
+# Pakete, deren Teil-Update (DNF überspringt sie, aktualisiert aber den Rest) das System unbrauchbar machen kann,
+# z.B. libplasma ohne den Rest von Plasma. Werden solche Pakete übersprungen, fragt das Skript vor dem Update nach.
+# Muster wie bei Bash-Globs ('*' = beliebige Zeichen), verglichen mit dem Paketnamen.
+CRITICAL_PACKAGES=(
+    'kernel*' 'glibc*' 'systemd*' 'dnf*' 'libdnf*' 'rpm' 'rpm-*' 'grub2*' 'shim*' 'dracut*' 'linux-firmware*'
+    'selinux-policy*' 'mesa-*' 'NetworkManager*' 'pipewire*' 'wireplumber*' 'xorg-x11-server*' 'xwayland*'
+    'plasma-*' 'libplasma*' 'kf6-*' 'kwin*' 'sddm*' 'qt6-*' 'gnome-shell*' 'mutter*' 'gdm*' 'gtk4*' 'glib2*'
+)
 
 # =========================================================
 # FUNKTIONEN & INITIALISIERUNG
@@ -63,6 +73,11 @@ Optionen:
   --snap           Aktiviert Snap-Updates (falls installiert und aktiv).
   --firmware       Spielt Firmware-Updates über fwupd ein (falls installiert).
                    Ein dafür nötiger Neustart erfolgt nicht automatisch.
+  --yes            Beantwortet die Rückfrage bei kritischen Befunden der
+                   DNF-Vorabprüfung (Teil-Update von Kernpaketen, Entfernen
+                   oder Herabstufen von Paketen, Fehler) mit Ja. Ohne diese
+                   Option wird das DNF-Update in solchen Fällen ohne Terminal
+                   (z.B. per Cron) übersprungen.
   --log <Datei>    Schreibt die komplette Ausgabe zusätzlich in <Datei>
                    (Farben werden dabei deaktiviert).
   --dry-run        Zeigt nur an, welche Befehle ausgeführt würden, ohne
@@ -75,7 +90,8 @@ Exit-Codes:
   0                Alle Schritte erfolgreich (bzw. Dry-Run abgeschlossen).
   1                Ungültiger Aufruf, ungeeignete Umgebung (kein Fedora,
                    Start als root) oder Teilfehler (von DNF übersprungene
-                   Pakete, Flatpak/Snap/Firmware).
+                   Pakete, nach kritischen Befunden nicht ausgeführtes
+                   DNF-Update, Flatpak/Snap/Firmware).
   sonstige         Abbruch durch einen fehlgeschlagenen Befehl.
 EOF
 }
@@ -90,6 +106,7 @@ while [[ "$#" -gt 0 ]]; do
         --snap) RUN_SNAP_UPDATE="true" ;;
         --firmware) RUN_FIRMWARE_UPDATE="true" ;;
         --dry-run) DRY_RUN="true" ;;
+        --yes) ASSUME_YES="true" ;;
         -h|--help)
             print_usage
             exit 0
@@ -166,6 +183,9 @@ cleanup() {
     if [[ -n "${DNF_OUTPUT_FILE:-}" ]]; then
         rm -f "$DNF_OUTPUT_FILE"
     fi
+    if [[ -n "${DNF_PREVIEW_FILE:-}" ]]; then
+        rm -f "$DNF_PREVIEW_FILE"
+    fi
 }
 trap cleanup EXIT
 
@@ -198,10 +218,11 @@ fi
 # - DNF_SKIPPED: Namen der übersprungenen Pakete (ohne die Verursacher selbst)
 # - DNF_BLOCKERS: installierte Pakete, die eine alte Version voraussetzen ("installiertes Paket X benötigt ..."),
 #   jeweils mit der Paketquelle, aus der sie stammen (falls DNF sie nennt), z.B. "foo (copr:...)"
+# Aufruf: collect_dnf_skipped <Datei mit der DNF-Ausgabe>
 DNF_SKIPPED=()
 DNF_BLOCKERS=()
 collect_dnf_skipped() {
-    local line name in_table="false"
+    local file=$1 line name in_table="false"
     local -a skipped=() blockers=()
     local -A seen=() blocker_seen=() blocker_repo=()
     local blocker_re='(installiertes Paket|installed package) ([^[:space:]]+) (benötigt|requires) '
@@ -232,8 +253,10 @@ collect_dnf_skipped() {
         else
             in_table="false"
         fi
-    done < "$DNF_OUTPUT_FILE"
+    done < "$file"
 
+    DNF_SKIPPED=()
+    DNF_BLOCKERS=()
     for name in "${skipped[@]}"; do
         [[ -n "${blocker_seen[$name]:-}" ]] || DNF_SKIPPED+=("$name")
     done
@@ -257,17 +280,136 @@ join_list() {
     printf '%s' "${out//$'\x1f'/, }"
 }
 
+# Liest die Sektionen "Removing:", "Removing dependent packages:" und "Downgrading:" aus der (englischen)
+# Transaktionsübersicht von dnf5/dnf4. Aufruf: collect_dnf_section_packages <Datei> <remove|downgrade>
+collect_dnf_section_packages() {
+    local file=$1 kind=$2 line in_section="false"
+    local -A seen=()
+    local remove_re='^(Removing|Removing dependent packages):[[:space:]]*$'
+    local downgrade_re='^Downgrading:[[:space:]]*$'
+    local row_re='^[[:space:]]+([^[:space:]]+)[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+'
+    local header_re
+    if [[ "$kind" == "remove" ]]; then header_re=$remove_re; else header_re=$downgrade_re; fi
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ $header_re ]]; then
+            in_section="true"
+        elif [[ "$in_section" == "true" && "$line" =~ $row_re ]]; then
+            # Unterzeilen wie "   replacing foo ..." gehören zum Paket darüber
+            [[ "${BASH_REMATCH[1]}" == "replacing" ]] && continue
+            [[ -n "${seen[${BASH_REMATCH[1]}]:-}" ]] || { seen[${BASH_REMATCH[1]}]=1; printf '%s\n' "${BASH_REMATCH[1]}"; }
+        else
+            in_section="false"
+        fi
+    done < "$file"
+}
+
+# Prüft, ob ein Paketname zu einem Muster aus CRITICAL_PACKAGES passt
+is_critical_package() {
+    local pattern
+    for pattern in "${CRITICAL_PACKAGES[@]}"; do
+        # shellcheck disable=SC2053  # das Muster soll als Glob wirken
+        [[ "$1" == $pattern ]] && return 0
+    done
+    return 1
+}
+
+# Vorabprüfung: Spielt die Transaktion mit '--assumeno' durch (DNF löst alles auf, ändert aber nichts) und
+# sammelt kritische Befunde in DNF_CRITICAL. Die Ausgabe wird auf Englisch erzeugt (LC_ALL=C), damit die
+# Auswertung nicht von der Sprache abhängt.
+DNF_CRITICAL=()
+DNF_PREVIEW_FILE=""
+dnf_preflight() {
+    local rc=0 name preview
+    local -a critical_skipped=() removed=() downgraded=()
+    DNF_PREVIEW_FILE=$(mktemp)
+    run_step sudo env LC_ALL=C dnf upgrade --refresh --assumeno > "$DNF_PREVIEW_FILE" 2>&1 || rc=$?
+    [[ "$DRY_RUN" == "true" ]] && cat "$DNF_PREVIEW_FILE"
+
+    collect_dnf_skipped "$DNF_PREVIEW_FILE"
+    for name in "${DNF_SKIPPED[@]}"; do
+        is_critical_package "$name" && critical_skipped+=("$name")
+    done
+    mapfile -t removed < <(collect_dnf_section_packages "$DNF_PREVIEW_FILE" remove)
+    mapfile -t downgraded < <(collect_dnf_section_packages "$DNF_PREVIEW_FILE" downgrade)
+
+    if [[ ${#critical_skipped[@]} -gt 0 ]]; then
+        local msg
+        msg="Teil-Update von Kernpaketen: DNF würde diese Updates überspringen, den Rest aber einspielen: $(join_list "${critical_skipped[@]}")."
+        if [[ ${#DNF_BLOCKERS[@]} -gt 0 ]]; then
+            msg+=" Ursache: $(join_list "${DNF_BLOCKERS[@]}"). Abhilfe: dieses Paket entfernen ('sudo dnf remove <Paket>') und das Skript erneut starten, oder auf ein passendes Update warten."
+        fi
+        DNF_CRITICAL+=("$msg")
+    fi
+    if [[ ${#removed[@]} -gt 0 ]]; then
+        DNF_CRITICAL+=("DNF würde Pakete entfernen: $(join_list "${removed[@]}").")
+    fi
+    if [[ ${#downgraded[@]} -gt 0 ]]; then
+        DNF_CRITICAL+=("DNF würde Pakete auf eine ältere Version herabstufen: $(join_list "${downgraded[@]}").")
+    fi
+    # '--assumeno' bricht eine anstehende Transaktion mit Code 1 ab ("Operation aborted"); das ist kein Fehler
+    preview=$(<"$DNF_PREVIEW_FILE")
+    if (( rc != 0 )) && [[ "${preview,,}" != *"operation aborted"* ]]; then
+        DNF_CRITICAL+=("Die Vorabprüfung von DNF ist fehlgeschlagen (Code $rc), siehe Ausgabe oben.")
+    fi
+}
+
+# Fragt nach, ob trotz kritischer Befunde aktualisiert werden soll. Rückgabe 0 = fortfahren.
+confirm_dnf_upgrade() {
+    local finding answer
+    printf '\n'
+    warning "Die Vorabprüfung von DNF hat kritische Punkte gefunden. Ein Update in diesem Zustand kann das System beschädigen (z.B. Desktop startet nicht mehr)."
+    for finding in "${DNF_CRITICAL[@]}"; do
+        printf '%b  • %s%b\n' "$YELLOW" "$finding" "$RESET"
+    done
+    if [[ "$ASSUME_YES" == "true" ]]; then
+        warning "Fahre trotzdem fort (--yes)."
+        return 0
+    fi
+    if [[ ! -t 0 ]]; then
+        error "Keine Rückfrage möglich (keine interaktive Eingabe). Das DNF-Update wird übersprungen; mit --yes würde es trotzdem ausgeführt."
+        return 1
+    fi
+    read -r -p "Trotzdem mit dem DNF-Update fortfahren? [j/N] " answer || answer=""
+    case "${answer,,}" in
+        j|ja|y|yes) return 0 ;;
+    esac
+    warning "DNF-Update auf Wunsch übersprungen."
+    return 1
+}
+
 printf '\n'
-info "Starte System-Updates via DNF..."
-DNF_OUTPUT_FILE=$(mktemp)
-# Die Ausgabe wird zusätzlich gesammelt, um übersprungene Pakete am Ende zusammenzufassen
-run_step sudo dnf upgrade --refresh -y 2>&1 | tee "$DNF_OUTPUT_FILE"
-collect_dnf_skipped
-if [[ ${#DNF_SKIPPED[@]} -gt 0 ]]; then
-    UPDATE_WARNINGS+=("DNF-Konflikte")
+info "Prüfe die anstehende DNF-Transaktion (Vorabprüfung ohne Änderungen, lädt ggf. Paketquellen neu)..."
+dnf_preflight
+DNF_UPGRADE_SKIPPED="false"
+if [[ ${#DNF_CRITICAL[@]} -gt 0 ]]; then
+    # Die Vorschau von DNF zeigen, damit die Befunde nachvollziehbar sind
+    cat "$DNF_PREVIEW_FILE"
+    if ! confirm_dnf_upgrade; then
+        DNF_UPGRADE_SKIPPED="true"
+        UPDATE_WARNINGS+=("DNF-Update nicht ausgeführt")
+    fi
+else
+    success "Vorabprüfung ohne kritische Befunde."
+fi
+DNF_SKIPPED=()
+DNF_BLOCKERS=()
+
+if [[ "$DNF_UPGRADE_SKIPPED" != "true" ]]; then
+    printf '\n'
+    info "Starte System-Updates via DNF..."
+    DNF_OUTPUT_FILE=$(mktemp)
+    # Die Ausgabe wird zusätzlich gesammelt, um übersprungene Pakete am Ende zusammenzufassen.
+    # '--refresh' entfällt, die Paketquellen hat die Vorabprüfung gerade geladen.
+    run_step sudo dnf upgrade -y 2>&1 | tee "$DNF_OUTPUT_FILE"
+    collect_dnf_skipped "$DNF_OUTPUT_FILE"
+    if [[ ${#DNF_SKIPPED[@]} -gt 0 ]]; then
+        UPDATE_WARNINGS+=("DNF-Konflikte")
+    fi
 fi
 
-if [[ "$RUN_AUTOREMOVE" == "true" ]]; then
+if [[ "$DNF_UPGRADE_SKIPPED" == "true" ]]; then
+    info "DNF 'autoremove' entfällt, weil das DNF-Update nicht ausgeführt wurde."
+elif [[ "$RUN_AUTOREMOVE" == "true" ]]; then
     printf '\n'
     info "Führe DNF Autoremove aus..."
     run_step sudo dnf autoremove -y
@@ -515,6 +657,10 @@ else
 fi
 
 printf '%b%s %s%b\n' "$REBOOT_COLOR" "$REBOOT_ICON" "$REBOOT_MSG" "$RESET"
+
+if [[ "$DNF_UPGRADE_SKIPPED" == "true" ]]; then
+    warning "Das DNF-Update wurde wegen kritischer Befunde der Vorabprüfung nicht ausgeführt. Details stehen oben."
+fi
 
 if [[ ${#DNF_SKIPPED[@]} -gt 0 ]]; then
     warning "DNF hat Updates wegen Abhängigkeitskonflikten übersprungen: $(join_list "${DNF_SKIPPED[@]}")."
