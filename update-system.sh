@@ -74,7 +74,8 @@ Optionen:
 Exit-Codes:
   0                Alle Schritte erfolgreich (bzw. Dry-Run abgeschlossen).
   1                Ungültiger Aufruf, ungeeignete Umgebung (kein Fedora,
-                   Start als root) oder Teilfehler (Flatpak/Snap/Firmware).
+                   Start als root) oder Teilfehler (von DNF übersprungene
+                   Pakete, Flatpak/Snap/Firmware).
   sonstige         Abbruch durch einen fehlgeschlagenen Befehl.
 EOF
 }
@@ -162,6 +163,9 @@ cleanup() {
     if [[ -n "${FLATPAK_OUTPUT_FILE:-}" ]]; then
         rm -f "$FLATPAK_OUTPUT_FILE"
     fi
+    if [[ -n "${DNF_OUTPUT_FILE:-}" ]]; then
+        rm -f "$DNF_OUTPUT_FILE"
+    fi
 }
 trap cleanup EXIT
 
@@ -187,9 +191,81 @@ else
     SUDO_KEEPALIVE_PID=$!
 fi
 
+# Wertet die Ausgabe von 'dnf upgrade' aus: Welche Updates hat DNF wegen Konflikten oder nicht auflösbarer
+# Abhängigkeiten übersprungen, und welche installierten Pakete verursachen das? dnf5 meldet so etwas nur als
+# Tabelle ("Pakete mit Konflikten werden übersprungen:") und endet trotzdem mit Code 0.
+# Erkannt werden die deutschen und englischen Texte von dnf5 (bzw. dnf4: "Skipping packages ...").
+# - DNF_SKIPPED: Namen der übersprungenen Pakete (ohne die Verursacher selbst)
+# - DNF_BLOCKERS: installierte Pakete, die eine alte Version voraussetzen ("installiertes Paket X benötigt ..."),
+#   jeweils mit der Paketquelle, aus der sie stammen (falls DNF sie nennt), z.B. "foo (copr:...)"
+DNF_SKIPPED=()
+DNF_BLOCKERS=()
+collect_dnf_skipped() {
+    local line name in_table="false"
+    local -a skipped=() blockers=()
+    local -A seen=() blocker_seen=() blocker_repo=()
+    local blocker_re='(installiertes Paket|installed package) ([^[:space:]]+) (benötigt|requires) '
+    local repo_re='(Paket|package) ([^[:space:]]+) (aus|from) ([^[:space:]]+) (benötigt|requires) '
+    local header_re='(übersprungen|[Ss]kipping[^:]*):[[:space:]]*$'
+    local row_re='^[[:space:]]+([^[:space:]]+)[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+'
+
+    # Paketname aus "name-version-release.arch" (die Architektur hängt am Release)
+    pkg_name() { local n=${1%-*}; printf '%s' "${n%-*}"; }
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ $blocker_re ]]; then
+            name=$(pkg_name "${BASH_REMATCH[2]}")
+            [[ -n "${blocker_seen[$name]:-}" ]] || { blocker_seen[$name]=1; blockers+=("$name"); }
+        fi
+        if [[ "$line" =~ $repo_re && "${BASH_REMATCH[4]}" != @* ]]; then
+            name=$(pkg_name "${BASH_REMATCH[2]}")
+            [[ -n "${blocker_repo[$name]:-}" ]] || blocker_repo[$name]=${BASH_REMATCH[4]}
+        fi
+        if [[ "$line" =~ $header_re ]]; then
+            in_table="true"
+        elif [[ "$in_table" == "true" && "$line" =~ ^[[:space:]]*\( ]]; then
+            # dnf4 schreibt unter die Überschrift noch "(add '--best --allowerasing' ...)"
+            continue
+        elif [[ "$in_table" == "true" && "$line" =~ $row_re ]]; then
+            name=${BASH_REMATCH[1]}
+            [[ -n "${seen[$name]:-}" ]] || { seen[$name]=1; skipped+=("$name"); }
+        else
+            in_table="false"
+        fi
+    done < "$DNF_OUTPUT_FILE"
+
+    for name in "${skipped[@]}"; do
+        [[ -n "${blocker_seen[$name]:-}" ]] || DNF_SKIPPED+=("$name")
+    done
+    for name in "${blockers[@]}"; do
+        if [[ -n "${blocker_repo[$name]:-}" ]]; then
+            DNF_BLOCKERS+=("$name (${blocker_repo[$name]})")
+        else
+            DNF_BLOCKERS+=("$name")
+        fi
+    done
+    # Falls nur Verursacher in der Tabelle standen, sind sie selbst das übersprungene Update
+    if [[ ${#DNF_SKIPPED[@]} -eq 0 && ${#skipped[@]} -gt 0 ]]; then
+        DNF_SKIPPED=("${skipped[@]}")
+    fi
+}
+
+# Verbindet die Argumente zu "a, b, c"
+join_list() {
+    local out
+    out=$(IFS=$'\x1f'; printf '%s' "$*")
+    printf '%s' "${out//$'\x1f'/, }"
+}
+
 printf '\n'
 info "Starte System-Updates via DNF..."
-run_step sudo dnf upgrade --refresh -y
+DNF_OUTPUT_FILE=$(mktemp)
+# Die Ausgabe wird zusätzlich gesammelt, um übersprungene Pakete am Ende zusammenzufassen
+run_step sudo dnf upgrade --refresh -y 2>&1 | tee "$DNF_OUTPUT_FILE"
+collect_dnf_skipped
+if [[ ${#DNF_SKIPPED[@]} -gt 0 ]]; then
+    UPDATE_WARNINGS+=("DNF-Konflikte")
+fi
 
 if [[ "$RUN_AUTOREMOVE" == "true" ]]; then
     printf '\n'
@@ -403,7 +479,17 @@ else
     # enden mit 1. Daher zusätzlich den Ausgabetext prüfen; LC_ALL=C sorgt für englische Ausgabe.
     # Groß-/Kleinschreibung wird ignoriert, damit eine geänderte Schreibweise in dnf5 nicht stört.
     if (( NEEDS_RESTART_RC == 1 )) && [[ "${NEEDS_RESTART_OUTPUT,,}" == *"reboot is required"* ]]; then
-        REBOOT_MSG="System-Neustart empfohlen (Systemkomponenten aktualisiert)."
+        # needs-restarting vergleicht mit dem Systemstart, nicht mit diesem Lauf: Die Komponenten können auch
+        # bei einem früheren Update aktualisiert worden sein. Die aufgelisteten Pakete ("  * kernel") nennen.
+        restart_pkgs=()
+        while IFS= read -r line; do
+            [[ "$line" =~ ^[[:space:]]*\*[[:space:]]+([^[:space:]]+) ]] && restart_pkgs+=("${BASH_REMATCH[1]}")
+        done <<< "$NEEDS_RESTART_OUTPUT"
+        if [[ ${#restart_pkgs[@]} -gt 0 ]]; then
+            REBOOT_MSG="System-Neustart empfohlen (seit dem letzten Systemstart aktualisiert: $(join_list "${restart_pkgs[@]}"))."
+        else
+            REBOOT_MSG="System-Neustart empfohlen (Systemkomponenten wurden seit dem letzten Systemstart aktualisiert)."
+        fi
         REBOOT_COLOR="$YELLOW"
         REBOOT_ICON="⚠"
     else
@@ -429,6 +515,16 @@ else
 fi
 
 printf '%b%s %s%b\n' "$REBOOT_COLOR" "$REBOOT_ICON" "$REBOOT_MSG" "$RESET"
+
+if [[ ${#DNF_SKIPPED[@]} -gt 0 ]]; then
+    warning "DNF hat Updates wegen Abhängigkeitskonflikten übersprungen: $(join_list "${DNF_SKIPPED[@]}")."
+    if [[ ${#DNF_BLOCKERS[@]} -gt 0 ]]; then
+        printf '%b  Ursache: Diese installierten Pakete setzen noch die alten Versionen voraus: %s. Abhilfe: auf ein passendes Update dieser Pakete warten oder sie entfernen. Details stehen oben in der DNF-Ausgabe.%b\n' \
+            "$YELLOW" "$(join_list "${DNF_BLOCKERS[@]}")" "$RESET"
+    else
+        printf '%b  Details stehen oben in der DNF-Ausgabe.%b\n' "$YELLOW" "$RESET"
+    fi
+fi
 
 if [[ ${#FLATPAK_EOL_RUNTIMES[@]} -gt 0 ]]; then
     eol_apps="unbekannt"
