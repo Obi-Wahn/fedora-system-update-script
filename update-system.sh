@@ -421,24 +421,84 @@ fi
 # flatpak gibt vor dem Start eine nummerierte Tabelle aus (" 9.     org.example.App  stable  u  flathub  < 12 MB");
 # die Nummer in der Fortschrittszeile verweist auf diese Tabellenzeile. Alle übrigen Zeilen bleiben unverändert.
 # Das Muster hängt nur an "<Nummer>/<Anzahl> …", nicht am (übersetzten) Text davor.
+# Aufruf: flatpak_annotate [breite]
+# Mit einer Terminalbreite > 0 bleibt der Fortschritt eines Eintrags in einer Zeile: jede neue Fortschrittszeile
+# überschreibt die vorige (\r, Rest der Zeile löschen), erst beim nächsten Eintrag oder einer anderen Meldung folgt
+# ein Zeilenumbruch. Damit die Zeile nicht umbricht (dann wirkt \r nur auf die letzte Bildschirmzeile), wird sie bei
+# Bedarf auf die Breite gekürzt: zuerst die ID in der Mitte, bei sehr schmalem Terminal entfällt auch der Balken. Ohne Breite (keine Ausgabe auf ein Terminal, z. B. Pipe
+# oder --log) erscheint jede Fortschrittszeile wie bisher einzeln.
 flatpak_annotate() {
-    local line
+    local width=${1:-0}
+    local line key="" open="" id prefix dots rest suffix max keep
     local -A ids=()
     local row_re='^[[:space:]]*([0-9]+)\.[[:space:]]+([^[:space:]]+)'
     local progress_re='^(.*[^0-9])([0-9]+)/([0-9]+)( ?…)(.*)$'
     while IFS= read -r line || [[ -n "$line" ]]; do
+        line=${line%$'\r'}
+        line=${line##*$'\r'}
         if [[ "$line" =~ $row_re ]]; then
             ids[${BASH_REMATCH[1]}]=${BASH_REMATCH[2]}
-        elif [[ "$line" =~ $progress_re ]] && [[ -n "${ids[${BASH_REMATCH[2]}]:-}" ]]; then
-            line="${BASH_REMATCH[1]}${BASH_REMATCH[2]}/${BASH_REMATCH[3]} ${ids[${BASH_REMATCH[2]}]}${BASH_REMATCH[4]}${BASH_REMATCH[5]}"
+        elif [[ "$line" =~ $progress_re ]]; then
+            key="${BASH_REMATCH[2]}/${BASH_REMATCH[3]}"
+            id=${ids[${BASH_REMATCH[2]}]:-}
+            prefix="${BASH_REMATCH[1]}$key"
+            dots=${BASH_REMATCH[4]}
+            rest=${BASH_REMATCH[5]}
+            suffix="$dots$rest"
+            if (( width <= 0 )); then
+                if [[ -n "$id" ]]; then line="$prefix $id$suffix"; fi
+                printf '%s\n' "$line"
+                continue
+            fi
+            max=$(( width - 1 ))
+            # Zu lang: erst die ID kürzen, reicht das nicht, auch den Balken weglassen (Prozent bleibt sichtbar)
+            if [[ -n "$id" ]] && (( ${#prefix} + 1 + ${#id} + ${#suffix} > max )); then
+                if (( ${#prefix} + 1 + 12 + ${#suffix} > max )) && [[ "$rest" =~ [[:space:]]([0-9]+%.*)$ ]]; then
+                    suffix="$dots  ${BASH_REMATCH[1]}"
+                fi
+                keep=$(( max - ${#prefix} - 1 - ${#suffix} - 1 ))
+                (( keep >= 8 )) || keep=8
+                if (( keep + 1 < ${#id} )); then
+                    id="${id:0:$(( (keep + 1) / 2 ))}…${id:${#id}-$(( keep / 2 ))}"
+                fi
+            fi
+            if [[ -n "$id" ]]; then
+                line="$prefix $id$suffix"
+            fi
+            line=${line:0:max}
+            [[ -z "$open" || "$open" == "$key" ]] || printf '\n'
+            printf '\r%s\033[K' "$line"
+            open=$key
+            continue
+        fi
+        if [[ -n "$open" ]]; then
+            printf '\n'
+            open=""
         fi
         printf '%s\n' "$line"
     done
+    if [[ -n "$open" ]]; then
+        printf '\n'
+    fi
+}
+
+# Gibt die Breite des Terminals aus, auf das Dateideskriptor 3 zeigt (80, falls sie sich nicht ermitteln lässt).
+# Aufruf: { width=$(terminal_width); } 3>&1 (innerhalb von $(…) ist die Standardausgabe eine Pipe).
+terminal_width() {
+    local size cols
+    size=$(stty size <&3 2>/dev/null) || size=""
+    cols=${size##* }
+    if [[ "$cols" =~ ^[0-9]+$ ]] && (( cols > 0 )); then
+        printf '%s' "$cols"
+    else
+        printf '80'
+    fi
 }
 
 # Führt einen flatpak-Befehl für eine Installation ('system' oder 'user') aus: flatpak_step <scope> <befehl> [args...]
-# Die Ausgabe erscheint wie gewohnt (Fortschrittszeilen ergänzt um die Flatpak-ID, siehe flatpak_annotate) und wird
-# zusätzlich in FLATPAK_OUTPUT_FILE gesammelt (für den EOL-Hinweis).
+# Die Ausgabe erscheint wie gewohnt (Fortschrittszeilen ergänzt um die Flatpak-ID, im Terminal pro Eintrag in einer
+# Zeile, siehe flatpak_annotate). Die unveränderte Ausgabe wird zusätzlich in FLATPAK_OUTPUT_FILE gesammelt (für den
+# EOL-Hinweis).
 # - FLATPAK_FANCY_OUTPUT=0 schaltet die sich ständig neu zeichnende Fortschrittstabelle ab, die bei vielen
 #   Updates oder schmalem Terminal zu unlesbaren Zeilen führt.
 # - Die systemweite Installation läuft über sudo. Ohne Rechte entscheidet polkit, und das verweigert z.B.
@@ -450,13 +510,17 @@ flatpak_annotate() {
 #   aufgerufen), '/var/lib/flatpak/exports/share' liege nicht im Suchpfad. Daher wird der Wert des Aufrufers
 #   weitergegeben, bei Bedarf um dieses Verzeichnis ergänzt.
 flatpak_step() {
-    local scope=$1 cmd=$2
+    local scope=$1 cmd=$2 width
     shift 2
+    width=0
+    if [[ -t 1 ]]; then
+        { width=$(terminal_width); } 3>&1
+    fi
     if [[ "$scope" == "system" ]]; then
         run_step sudo env FLATPAK_FANCY_OUTPUT=0 FLATPAK_USER_DIR="$FLATPAK_USER_DIR" XDG_DATA_DIRS="$FLATPAK_XDG_DATA_DIRS" \
-            flatpak "$cmd" --system "$@" 2>&1 | flatpak_annotate | tee -a "$FLATPAK_OUTPUT_FILE"
+            flatpak "$cmd" --system "$@" 2>&1 | tee -a "$FLATPAK_OUTPUT_FILE" | flatpak_annotate "$width"
     else
-        run_step env FLATPAK_FANCY_OUTPUT=0 flatpak "$cmd" --user "$@" 2>&1 | flatpak_annotate | tee -a "$FLATPAK_OUTPUT_FILE"
+        run_step env FLATPAK_FANCY_OUTPUT=0 flatpak "$cmd" --user "$@" 2>&1 | tee -a "$FLATPAK_OUTPUT_FILE" | flatpak_annotate "$width"
     fi
 }
 
