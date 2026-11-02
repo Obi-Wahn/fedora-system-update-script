@@ -296,6 +296,65 @@ fi'
     # Die Tabelle bleibt unverändert, unbekannte Nummern ebenso
     [[ "$output" == *" 2.     org.mozilla.firefox                 stable   u    flathub            < 98,1 MB"* ]]
     [[ "$output" == *"Aktualisiere 3/2 …"* ]]
+    # Ohne Terminal keine überschriebenen Zeilen
+    [[ "$output" != *$'\r'* ]]
+}
+
+# flatpak-Attrappe mit zwei Einträgen und mehreren Fortschrittszeilen pro Eintrag
+mock_flatpak_progress() {
+    mock flatpak 'if [[ "$1" == update ]]; then
+cat <<OUT
+        ID                                  Zweig    Op   Entfernte Quelle   Herunterladen
+ 1.     org.freedesktop.Platform.GL.default 25.08    u    flathub            < 150,2 MB
+ 2.     org.mozilla.firefox                 stable   u    flathub            < 98,1 MB
+
+Aktualisiere 1/2 …
+Aktualisiere 1/2 …  ██████              30%  3,3 MB/s  00:12
+Aktualisiere 1/2 …  ████████████████████ 100%  4,2 MB/s  00:00
+Aktualisiere 2/2 …
+Aktualisiere 2/2 …  ████████████████████ 100%  4,2 MB/s  00:00
+Info: runtime org.example.Platform branch 1.0 is end-of-life, with reason:
+OUT
+fi'
+}
+
+# Startet das Skript in einem Pseudo-Terminal mit der angegebenen Spaltenzahl.
+run_script_in_terminal() {
+    local cols=$1
+    ln -sf "$(command -v stty)" "$MOCKBIN/stty"
+    run bash -c "script -qec \"stty cols $cols; env -u DBUS_SESSION_BUS_ADDRESS LANG=C.UTF-8 PATH='$MOCKBIN' /bin/bash '$SCRIPT'\" /dev/null </dev/null" 3>&-
+}
+
+@test "Flatpak-Fortschritt bleibt im Terminal pro Eintrag in einer Zeile" {
+    command -v script >/dev/null || skip "'script' (util-linux) ist nicht installiert"
+    mock_flatpak_progress
+    run_script_in_terminal 200
+    [ "$status" -eq 0 ]
+    local el=$'\033[K' cr=$'\r'
+    # Jede Fortschrittszeile überschreibt die vorige desselben Eintrags (kein Zeilenumbruch dazwischen)
+    [[ "$output" == *"${cr}Aktualisiere 1/2 org.freedesktop.Platform.GL.default …${el}${cr}Aktualisiere 1/2 org.freedesktop.Platform.GL.default …  ██████              30%  3,3 MB/s  00:12${el}${cr}Aktualisiere 1/2 org.freedesktop.Platform.GL.default …  ████████████████████ 100%"* ]]
+    # Erst beim nächsten Eintrag folgt ein Zeilenumbruch
+    [[ "$output" == *"100%  4,2 MB/s  00:00${el}"$'\r\n\r'"Aktualisiere 2/2 org.mozilla.firefox …${el}${cr}Aktualisiere 2/2 org.mozilla.firefox …  ████"* ]]
+    # Andere Meldungen beginnen in einer eigenen Zeile und werden weiter ausgewertet (EOL-Hinweis)
+    [[ "$output" == *"00:00${el}"$'\r\n'"Info: runtime org.example.Platform branch 1.0 is end-of-life"* ]]
+    [[ "$output" == *"Veraltete Flatpak-Laufzeitumgebungen"* ]]
+}
+
+@test "Flatpak-Fortschritt wird im schmalen Terminal gekürzt, zuerst in der ID" {
+    command -v script >/dev/null || skip "'script' (util-linux) ist nicht installiert"
+    mock_flatpak_progress
+    local el=$'\033[K' cr=$'\r'
+    # 80 Spalten: die ID wird in der Mitte gekürzt, der Balken bleibt
+    run_script_in_terminal 80
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"${cr}Aktualisiere 1/2 org.freed….default …  ██████              30%  3,3 MB/s  00:12${el}"* ]]
+    # 60 Spalten: zusätzlich entfällt der Balken, Prozent und Rate bleiben sichtbar
+    run_script_in_terminal 60
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"${cr}Aktualisiere 1/2 org.freed….default …  30%  3,3 MB/s  00:12${el}"* ]]
+    [[ "$output" == *"${cr}Aktualisiere 2/2 org.mozi….firefox …  100%  4,2 MB/s  00:00${el}"* ]]
+    # Zeilen, die passen, bleiben vollständig
+    [[ "$output" == *"${cr}Aktualisiere 2/2 org.mozilla.firefox …${el}"* ]]
 }
 
 @test "XDG_DATA_DIRS des Aufrufers wird an flatpak über sudo weitergegeben" {
