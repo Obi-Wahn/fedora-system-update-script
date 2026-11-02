@@ -563,6 +563,57 @@ EOF
     [[ "$output" == *"ohne Fehler ausgeführt"* ]]
 }
 
+@test "farbige DNF-Ausgabe (--color=always) wird ebenfalls ausgewertet" {
+    write_dnf_conflict_output
+    # Überschriften fett, Paketnamen farbig, wie libsmartcols sie bei --color=always ausgibt
+    sed -i -e 's/^\(Pakete mit .*:\)$/\x1b[1m\1\x1b[0m/' \
+        -e 's/^ \(lib[a-z-]*\|bluedevil\|plasma-applet-appgrid\)\( \+\)/ \x1b[1;32m\1\x1b[0m\2/' "$MOCK_DNF_UPGRADE_OUTPUT"
+    grep -q $'\e\\[1m' "$MOCK_DNF_UPGRADE_OUTPUT"
+    run_script
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"DNF hat Updates wegen Abhängigkeitskonflikten übersprungen: libheif, libheif-ffmpeg, libplasma, bluedevil."* ]]
+    [[ "$output" == *"libheif-freeworld (rpmfusion-free-updates)"* ]]
+}
+
+@test "farbige Vorschau: entfernte Pakete und Abbruch durch --assumeno werden erkannt" {
+    export MOCK_DNF_PREVIEW_OUTPUT="$BATS_TEST_TMPDIR/dnf-preview.txt"
+    export MOCK_DNF_PREVIEW_RC=1
+    printf '\e[1mRemoving:\e[0m\n \e[31mfoo\e[0m   x86_64   1.0-1.fc44   @System   1.0 MiB\n\e[1mOperation aborted by the user.\e[0m\n' > "$MOCK_DNF_PREVIEW_OUTPUT"
+    run_script
+    [[ "$output" == *"DNF würde Pakete entfernen: foo."* ]]
+    [[ "$output" != *"Vorabprüfung von DNF ist fehlgeschlagen"* ]]
+}
+
+# Startet das Skript in einem Pseudo-Terminal (über 'script' aus util-linux): run_script_tty [env-Zuweisungen] -- [Skript-Argumente]
+run_script_tty() {
+    local script_bin args="" arg
+    script_bin=$(command -v script) || skip "script (util-linux) fehlt"
+    local -a envs=()
+    while [[ $# -gt 0 && "$1" != -- ]]; do envs+=("$1"); shift; done
+    [[ "${1:-}" == -- ]] && shift
+    for arg in "$@"; do args+=" $(printf '%q' "$arg")"; done
+    run env -u DBUS_SESSION_BUS_ADDRESS -u NO_COLOR -u XDG_DATA_DIRS "${envs[@]}" PATH="$MOCKBIN" \
+        "$script_bin" -qec "/bin/bash $(printf '%q' "$SCRIPT")$args" /dev/null 3>&-
+}
+
+@test "im Terminal fordert das Skript DNF-Farben an, ohne Terminal nicht" {
+    run_script
+    called "sudo dnf upgrade -y"
+    called "sudo env LC_ALL=C dnf upgrade --refresh --assumeno"
+    : > "$CALLS"
+    run_script_tty
+    called "sudo dnf upgrade -y --color=always"
+    called "sudo env LC_ALL=C dnf upgrade --refresh --assumeno --color=always"
+}
+
+@test "NO_COLOR und --log verhindern DNF-Farben auch im Terminal" {
+    run_script_tty NO_COLOR=1
+    called "sudo dnf upgrade -y"
+    : > "$CALLS"
+    run_script_tty -- --log "$BATS_TEST_TMPDIR/log.txt"
+    called "sudo dnf upgrade -y"
+}
+
 # --- Vorabprüfung und Rückfrage bei kritischen DNF-Befunden ---------------
 
 # Vorschau (LC_ALL=C, --assumeno) wie im Fall von libplasma: Plasma würde nur teilweise aktualisiert
@@ -632,7 +683,8 @@ EOF
     run bash -c "printf 'j\n' | script -qec \"env -u DBUS_SESSION_BUS_ADDRESS PATH='$MOCKBIN' /bin/bash '$SCRIPT'\" /dev/null" 3>&-
     [ "$status" -eq 0 ]
     [[ "$output" == *"Trotzdem mit dem DNF-Update fortfahren? [j/N]"* ]]
-    called "sudo dnf upgrade -y"
+    # Im Terminal fordert das Skript DNF-Farben an
+    called "sudo dnf upgrade -y --color=always"
 }
 
 @test "Vorabprüfung: übersprungene Pakete außerhalb der Kernpakete lösen keine Rückfrage aus" {

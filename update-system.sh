@@ -132,6 +132,12 @@ if [[ -n "$LOGFILE" ]]; then
     GREEN="" BLUE="" YELLOW="" RED="" RESET=""
 fi
 
+# DNF färbt seine Ausgabe nur, wenn es direkt ins Terminal schreibt. Das Skript liest die Ausgabe aber mit
+# (Pipe bzw. Datei), daher werden die Farben ausdrücklich angefordert, sofern das Skript selbst Farben nutzt
+# (Terminal, kein NO_COLOR, kein --log). Die Auswertung entfernt die Farbcodes vorher (siehe strip_ansi).
+DNF_COLOR_OPTS=()
+[[ -n "$GREEN" ]] && DNF_COLOR_OPTS=(--color=always)
+
 # =========================================================
 # SYSTEMPRÜFUNGEN
 # =========================================================
@@ -219,6 +225,15 @@ fi
 # - DNF_BLOCKERS: installierte Pakete, die eine alte Version voraussetzen ("installiertes Paket X benötigt ..."),
 #   jeweils mit der Paketquelle, aus der sie stammen (falls DNF sie nennt), z.B. "foo (copr:...)"
 # Aufruf: collect_dnf_skipped <Datei mit der DNF-Ausgabe>
+# Entfernt ANSI-Steuersequenzen (Farben, Fett) aus einer Zeile: strip_ansi <Variablenname>
+strip_ansi() {
+    local -n _strip_line=$1
+    local ansi_re=$'\e''\[[0-9;]*[A-Za-z]'
+    while [[ "$_strip_line" =~ $ansi_re ]]; do
+        _strip_line=${_strip_line/"${BASH_REMATCH[0]}"/}
+    done
+}
+
 DNF_SKIPPED=()
 DNF_BLOCKERS=()
 collect_dnf_skipped() {
@@ -234,6 +249,7 @@ collect_dnf_skipped() {
     pkg_name() { local n=${1%-*}; printf '%s' "${n%-*}"; }
 
     while IFS= read -r line || [[ -n "$line" ]]; do
+        strip_ansi line
         if [[ "$line" =~ $blocker_re ]]; then
             name=$(pkg_name "${BASH_REMATCH[2]}")
             [[ -n "${blocker_seen[$name]:-}" ]] || { blocker_seen[$name]=1; blockers+=("$name"); }
@@ -291,6 +307,7 @@ collect_dnf_section_packages() {
     local header_re
     if [[ "$kind" == "remove" ]]; then header_re=$remove_re; else header_re=$downgrade_re; fi
     while IFS= read -r line || [[ -n "$line" ]]; do
+        strip_ansi line
         if [[ "$line" =~ $header_re ]]; then
             in_section="true"
         elif [[ "$in_section" == "true" && "$line" =~ $row_re ]]; then
@@ -322,7 +339,7 @@ dnf_preflight() {
     local rc=0 name preview
     local -a critical_skipped=() removed=() downgraded=()
     DNF_PREVIEW_FILE=$(mktemp)
-    run_step sudo env LC_ALL=C dnf upgrade --refresh --assumeno > "$DNF_PREVIEW_FILE" 2>&1 || rc=$?
+    run_step sudo env LC_ALL=C dnf upgrade --refresh --assumeno "${DNF_COLOR_OPTS[@]}" > "$DNF_PREVIEW_FILE" 2>&1 || rc=$?
     [[ "$DRY_RUN" == "true" ]] && cat "$DNF_PREVIEW_FILE"
 
     collect_dnf_skipped "$DNF_PREVIEW_FILE"
@@ -348,6 +365,7 @@ dnf_preflight() {
     fi
     # '--assumeno' bricht eine anstehende Transaktion mit Code 1 ab ("Operation aborted"); das ist kein Fehler
     preview=$(<"$DNF_PREVIEW_FILE")
+    strip_ansi preview
     if (( rc != 0 )) && [[ "${preview,,}" != *"operation aborted"* ]]; then
         DNF_CRITICAL+=("Die Vorabprüfung von DNF ist fehlgeschlagen (Code $rc), siehe Ausgabe oben.")
     fi
@@ -400,7 +418,7 @@ if [[ "$DNF_UPGRADE_SKIPPED" != "true" ]]; then
     DNF_OUTPUT_FILE=$(mktemp)
     # Die Ausgabe wird zusätzlich gesammelt, um übersprungene Pakete am Ende zusammenzufassen.
     # '--refresh' entfällt, die Paketquellen hat die Vorabprüfung gerade geladen.
-    run_step sudo dnf upgrade -y 2>&1 | tee "$DNF_OUTPUT_FILE"
+    run_step sudo dnf upgrade -y "${DNF_COLOR_OPTS[@]}" 2>&1 | tee "$DNF_OUTPUT_FILE"
     collect_dnf_skipped "$DNF_OUTPUT_FILE"
     if [[ ${#DNF_SKIPPED[@]} -gt 0 ]]; then
         UPDATE_WARNINGS+=("DNF-Konflikte")
