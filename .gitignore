@@ -1,0 +1,8 @@
+# Lokale Claude-Code-Einstellungen: enthalten gespeicherte Befehlsfreigaben,
+# in denen Tokens oder Passwörter im Klartext stehen können.
+.claude/settings.local.json
+CLAUDE.local.md
+
+# Umgebungsdateien mit Zugangsdaten
+.env
+.env.*
