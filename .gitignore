@@ -1,2 +1,7 @@
 # Lokale Claude-Code-Einstellungen (können freigegebene Befehle samt Zugangsdaten enthalten)
 .claude/settings.local.json
+CLAUDE.local.md
+
+# Umgebungsdateien mit Zugangsdaten
+.env
+.env.*
