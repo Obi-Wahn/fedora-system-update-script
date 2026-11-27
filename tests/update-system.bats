@@ -25,7 +25,7 @@ setup() {
     # Nur diese echten Werkzeuge stehen im PATH, damit lokal installierte
     # flatpak/snap/fwupdmgr/notify-send die Ergebnisse nicht beeinflussen.
     local tool
-    for tool in cat date env mktemp rm sleep sort tail tee touch uname; do
+    for tool in cat date env ls mktemp rm sleep sort tail tee touch uname; do
         ln -s "$(command -v "$tool")" "$MOCKBIN/$tool"
     done
 
@@ -35,6 +35,20 @@ if [[ "$1" == upgrade && " $* " == *" --assumeno "* ]]; then [[ -n "${MOCK_DNF_P
 if [[ "$1" == upgrade ]]; then [[ -n "${MOCK_DNF_UPGRADE_OUTPUT:-}" ]] && cat "$MOCK_DNF_UPGRADE_OUTPUT"; exit "${MOCK_DNF_UPGRADE_RC:-0}"; fi
 exit 0'
     mock rpm '[[ -n "${MOCK_KERNEL:-}" ]] || exit 1; [[ "$*" == *--queryformat* ]] && echo "$MOCK_KERNEL"; exit 0'
+
+    # Eigenes, leeres /boot, damit das echte /boot die Ergebnisse nicht beeinflusst (ohne vmlinuz-* keine Prüfung)
+    BOOT="$BATS_TEST_TMPDIR/boot"
+    mkdir -p "$BOOT"
+    export UPDATE_SYSTEM_BOOT_DIR="$BOOT"
+}
+
+# Richtet Kernel <ver> in $BOOT vollständig ein: boot_kernel <ver> [ohne vmlinuz|initramfs|entry]
+boot_kernel() {
+    local ver=$1 skip=${2:-}
+    mkdir -p "$BOOT/loader/entries"
+    [[ "$skip" == vmlinuz ]] || : > "$BOOT/vmlinuz-$ver"
+    [[ "$skip" == initramfs ]] || : > "$BOOT/initramfs-$ver.img"
+    [[ "$skip" == entry ]] || : > "$BOOT/loader/entries/0123456789abcdef-$ver.conf"
 }
 
 # Legt eine Attrappe an, die ihren Aufruf in $CALLS protokolliert und dann <body> ausführt.
@@ -906,4 +920,79 @@ EOF
     run_script
     [ "$status" -eq 0 ]
     [[ "$output" == *"Neustart empfohlen (seit dem letzten Systemstart aktualisiert: glibc, systemd)"* ]]
+}
+
+# --- Kernel-Einrichtung in /boot -------------------------------------------
+
+@test "vollständig eingerichtete Kernel ergeben keine Warnung" {
+    export MOCK_KERNEL=$'999.0.1-1.fc99.x86_64\n999.0.2-1.fc99.x86_64'
+    boot_kernel 999.0.1-1.fc99.x86_64
+    boot_kernel 999.0.2-1.fc99.x86_64
+    run_script
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"nicht vollständig in /boot"* ]]
+    [[ "$output" == *"Neustart empfohlen (neuerer Kernel 999.0.2-1.fc99.x86_64 installiert"* ]]
+    called "sudo ls -1 -- $BOOT/loader/entries"
+}
+
+@test "neuester Kernel ohne Einrichtung in /boot: Reparaturbefehl statt Neustart-Empfehlung" {
+    export MOCK_KERNEL=$'999.0.1-1.fc99.x86_64\n999.0.2-1.fc99.x86_64'
+    boot_kernel 999.0.1-1.fc99.x86_64
+    run_script
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Kernel 999.0.2-1.fc99.x86_64 ist installiert, aber nicht vollständig in /boot eingerichtet (fehlt: vmlinuz-999.0.2-1.fc99.x86_64, initramfs-999.0.2-1.fc99.x86_64.img, Booteintrag)"* ]]
+    [[ "$output" == *"sudo kernel-install add 999.0.2-1.fc99.x86_64 /lib/modules/999.0.2-1.fc99.x86_64/vmlinuz"* ]]
+    [[ "$output" == *"sudo grubby --set-default /boot/vmlinuz-999.0.2-1.fc99.x86_64"* ]]
+    [[ "$output" == *"Neustart hilft noch nicht: Kernel 999.0.2-1.fc99.x86_64"* ]]
+    [[ "$output" != *"Neustart empfohlen"* ]]
+    [[ "$output" == *"Teilfehlern abgeschlossen (Kernel-Einrichtung)"* ]]
+    # Repariert wird nichts automatisch
+    not_called "kernel-install"
+    not_called "grubby"
+}
+
+@test "fehlender Booteintrag allein wird erkannt" {
+    export MOCK_KERNEL="999.0.1-1.fc99.x86_64"
+    boot_kernel 999.0.1-1.fc99.x86_64 entry
+    run_script
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"(fehlt: Booteintrag)"* ]]
+}
+
+@test "älterer Kernel ohne Einrichtung: Warnung, aber Neustart-Empfehlung bleibt" {
+    export MOCK_KERNEL=$'999.0.1-1.fc99.x86_64\n999.0.2-1.fc99.x86_64'
+    boot_kernel 999.0.1-1.fc99.x86_64 initramfs
+    boot_kernel 999.0.2-1.fc99.x86_64
+    run_script
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Kernel 999.0.1-1.fc99.x86_64 ist installiert, aber nicht vollständig in /boot eingerichtet (fehlt: initramfs-999.0.1-1.fc99.x86_64.img)"* ]]
+    [[ "$output" == *"sudo kernel-install add 999.0.1-1.fc99.x86_64"* ]]
+    [[ "$output" != *"grubby --set-default"* ]]
+    [[ "$output" == *"Neustart empfohlen (neuerer Kernel 999.0.2-1.fc99.x86_64 installiert"* ]]
+}
+
+@test "ohne vmlinuz-* in /boot (andere Boot-Aufteilung) entfällt die Prüfung" {
+    export MOCK_KERNEL="999.0.1-1.fc99.x86_64"
+    run_script
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"nicht vollständig in /boot"* ]]
+    not_called "sudo ls"
+}
+
+@test "Dry-Run prüft vmlinuz und initramfs ohne sudo, Booteinträge entfallen" {
+    boot_kernel 999.0.1-1.fc99.x86_64
+    boot_kernel 999.0.2-1.fc99.x86_64 entry
+    : > "$BOOT/vmlinuz-999.0.3-1.fc99.x86_64"
+    export MOCK_KERNEL=$'999.0.1-1.fc99.x86_64\n999.0.2-1.fc99.x86_64\n999.0.3-1.fc99.x86_64'
+    run_script --dry-run
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"Kernel 999.0.2-1.fc99.x86_64 ist installiert"* ]]
+    [[ "$output" == *"Kernel 999.0.3-1.fc99.x86_64 ist installiert, aber nicht vollständig in /boot eingerichtet (fehlt: initramfs-999.0.3-1.fc99.x86_64.img)"* ]]
+    not_called "^sudo"
+}
+
+@test "vor der DNF-Transaktion wird vom Abbrechen abgeraten" {
+    run_script
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"jetzt nicht abbrechen (Strg+C), bis DNF fertig ist"* ]]
 }
