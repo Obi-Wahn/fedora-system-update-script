@@ -95,7 +95,8 @@ Exit-Codes:
   1                Ungültiger Aufruf, ungeeignete Umgebung (kein Fedora,
                    Start als root) oder Teilfehler (von DNF übersprungene
                    Pakete, fehlgeschlagenes oder nach kritischen Befunden
-                   nicht ausgeführtes DNF-Update, Flatpak/Snap/Firmware).
+                   nicht ausgeführtes DNF-Update, Flatpak/Snap/Firmware,
+                   installierter Kernel ohne Einrichtung in /boot).
   sonstige         Abbruch durch einen fehlgeschlagenen Befehl.
 EOF
 }
@@ -477,6 +478,8 @@ DNF_BLOCKERS=()
 if [[ "$DNF_UPGRADE_SKIPPED" != "true" ]]; then
     printf '\n'
     info "Starte System-Updates via DNF..."
+    # Ein Abbruch mitten in der RPM-Transaktion kann z.B. einen Kernel ohne Booteintrag hinterlassen
+    [[ "$DRY_RUN" == "true" ]] || info "Bitte das Skript jetzt nicht abbrechen (Strg+C), bis DNF fertig ist."
     [[ ${#DNF_EXCLUDE_OPTS[@]} -eq 0 ]] || info "Ausgelassen (--exclude): $(join_list "${DNF_EXCLUDE_OPTS[@]#--exclude=}")"
     DNF_OUTPUT_FILE=$(mktemp)
     # Die Ausgabe wird zusätzlich gesammelt, um übersprungene Pakete am Ende zusammenzufassen.
@@ -739,9 +742,58 @@ info "Prüfe Systemstatus..."
 # Sichere Kernel-Prüfung
 CURRENT_KERNEL=$(uname -r)
 LATEST_KERNEL=""
+INSTALLED_KERNELS=()
 if rpm -q kernel-core &>/dev/null; then
-    LATEST_KERNEL=$(LC_ALL=C rpm -q kernel-core --queryformat '%{VERSION}-%{RELEASE}.%{ARCH}\n' | sort -V | tail -n 1 || true)
+    mapfile -t INSTALLED_KERNELS < <(LC_ALL=C rpm -q kernel-core --queryformat '%{VERSION}-%{RELEASE}.%{ARCH}\n' | sort -V || true)
+    if [[ ${#INSTALLED_KERNELS[@]} -gt 0 ]]; then
+        LATEST_KERNEL=${INSTALLED_KERNELS[-1]}
+    fi
 fi
+
+# Prüft, ob jeder installierte kernel-core auch in /boot eingerichtet ist (vmlinuz-<ver>, initramfs-<ver>.img und ein
+# BLS-Booteintrag in loader/entries). Das erledigt das Posttrans-Skript des Kernels ('kernel-install add'). Wird eine
+# DNF-Transaktion mittendrin abgebrochen, kann das fehlen: Das Paket gilt dann als installiert, der Bootloader kennt
+# den Kernel aber nicht, und ein Neustart startet weiter den alten. Das Skript repariert nichts selbst, sondern nennt
+# den Befehl dafür. Ergebnis in KERNEL_BOOT_BROKEN ("<ver>|<fehlende Teile>").
+# - Liegt in /boot gar kein vmlinuz-*, nutzt das System eine andere Aufteilung (z.B. Unified Kernel Images auf der
+#   EFI-Partition); dann entfällt die Prüfung.
+# - loader/entries ist unter Fedora nur für root lesbar, daher wird es über sudo gelesen. Im Dry-Run (ohne Rechte)
+#   oder wenn das Verzeichnis fehlt, entfällt nur die Prüfung der Booteinträge.
+# UPDATE_SYSTEM_BOOT_DIR ersetzt /boot (für die Tests).
+BOOT_DIR=${UPDATE_SYSTEM_BOOT_DIR:-/boot}
+KERNEL_BOOT_BROKEN=()
+check_kernel_boot_setup() {
+    local ver entry listing have_bls="false" bls_found
+    local -a missing=() entries=() vmlinuz=("$BOOT_DIR"/vmlinuz-*)
+    [[ -e "${vmlinuz[0]}" ]] || return 0
+    if [[ "$DRY_RUN" != "true" && -d "$BOOT_DIR/loader/entries" ]] \
+        && listing=$(sudo ls -1 -- "$BOOT_DIR/loader/entries" 2>/dev/null); then
+        have_bls="true"
+        mapfile -t entries <<< "$listing"
+    fi
+    for ver in "${INSTALLED_KERNELS[@]}"; do
+        missing=()
+        [[ -e "$BOOT_DIR/vmlinuz-$ver" ]] || missing+=("vmlinuz-$ver")
+        [[ -e "$BOOT_DIR/initramfs-$ver.img" ]] || missing+=("initramfs-$ver.img")
+        if [[ "$have_bls" == "true" ]]; then
+            bls_found="false"
+            for entry in "${entries[@]}"; do
+                if [[ "$entry" == "$ver.conf" || "$entry" == *"-$ver.conf" ]]; then
+                    bls_found="true"
+                    break
+                fi
+            done
+            [[ "$bls_found" == "true" ]] || missing+=("Booteintrag")
+        fi
+        [[ ${#missing[@]} -eq 0 ]] || KERNEL_BOOT_BROKEN+=("$ver|$(join_list "${missing[@]}")")
+    done
+}
+check_kernel_boot_setup
+LATEST_KERNEL_BROKEN="false"
+for broken in "${KERNEL_BOOT_BROKEN[@]}"; do
+    if [[ "${broken%%|*}" == "$LATEST_KERNEL" ]]; then LATEST_KERNEL_BROKEN="true"; fi
+done
+[[ ${#KERNEL_BOOT_BROKEN[@]} -eq 0 ]] || UPDATE_WARNINGS+=("Kernel-Einrichtung")
 
 # Nur ein installierter Kernel, der NEUER als der laufende ist, erfordert einen Neustart. Ein älterer
 # (z.B. weil ein selbst gebauter oder Test-Kernel läuft) ist kein Grund dafür.
@@ -752,7 +804,12 @@ if [[ -n "$LATEST_KERNEL" && "$CURRENT_KERNEL" != "$LATEST_KERNEL" ]] \
 fi
 
 # Neustart-Logik mit exakter Return-Code-Auswertung
-if [[ "$KERNEL_PENDING" == "true" ]]; then
+if [[ "$LATEST_KERNEL_BROKEN" == "true" ]]; then
+    # Ein Neustart würde den neuesten Kernel nicht starten, der Bootloader kennt ihn ja nicht
+    REBOOT_MSG="Neustart hilft noch nicht: Kernel $LATEST_KERNEL ist nicht vollständig in /boot eingerichtet. Erst die Einrichtung nachholen (Befehl siehe unten), dann neu starten."
+    REBOOT_COLOR="$YELLOW"
+    REBOOT_ICON="⚠"
+elif [[ "$KERNEL_PENDING" == "true" ]]; then
     # Der neuere Kernel kann auch aus einem früheren Update stammen, nach dem noch nicht neu gestartet wurde
     REBOOT_MSG="System-Neustart empfohlen (neuerer Kernel $LATEST_KERNEL installiert, es läuft noch $CURRENT_KERNEL)."
     REBOOT_COLOR="$YELLOW"
@@ -811,6 +868,17 @@ else
 fi
 
 printf '%b%s %s%b\n' "$REBOOT_COLOR" "$REBOOT_ICON" "$REBOOT_MSG" "$RESET"
+
+for broken in "${KERNEL_BOOT_BROKEN[@]}"; do
+    ver=${broken%%|*}
+    warning "Kernel $ver ist installiert, aber nicht vollständig in /boot eingerichtet (fehlt: ${broken#*|}). Ein Neustart startet ihn nicht."
+    printf '%b  Ursache: meist eine abgebrochene DNF-Transaktion, bei der das Einrichten des Kernels nicht mehr lief. Abhilfe: sudo kernel-install add %s /lib/modules/%s/vmlinuz%b\n' \
+        "$YELLOW" "$ver" "$ver" "$RESET"
+    if [[ "$ver" == "$LATEST_KERNEL" ]]; then
+        printf '%b  Danach als Standard-Kernel festlegen und neu starten: sudo grubby --set-default /boot/vmlinuz-%s%b\n' \
+            "$YELLOW" "$ver" "$RESET"
+    fi
+done
 
 if [[ "$DNF_UPGRADE_SKIPPED" == "true" ]]; then
     warning "Das DNF-Update wurde wegen kritischer Befunde der Vorabprüfung nicht ausgeführt. Details stehen oben."
