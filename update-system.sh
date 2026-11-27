@@ -16,6 +16,7 @@ RUN_FIRMWARE_UPDATE="false"
 DRY_RUN="false"
 ASSUME_YES="false"
 LOGFILE=""
+DNF_EXCLUDE_OPTS=()
 
 # Pakete, deren Teil-Update (DNF überspringt sie, aktualisiert aber den Rest) das System unbrauchbar machen kann,
 # z.B. libplasma ohne den Rest von Plasma. Werden solche Pakete übersprungen, fragt das Skript vor dem Update nach.
@@ -78,6 +79,9 @@ Optionen:
                    oder Herabstufen von Paketen, Fehler) mit Ja. Ohne diese
                    Option wird das DNF-Update in solchen Fällen ohne Terminal
                    (z.B. per Cron) übersprungen.
+  --exclude <Muster>
+                   Lässt Pakete beim DNF-Update aus (an 'dnf --exclude'
+                   weitergegeben, z.B. 'pipewire*,nss*'). Mehrfach nutzbar.
   --log <Datei>    Schreibt die komplette Ausgabe zusätzlich in <Datei>
                    (Farben werden dabei deaktiviert).
   --dry-run        Zeigt nur an, welche Befehle ausgeführt würden, ohne
@@ -90,8 +94,8 @@ Exit-Codes:
   0                Alle Schritte erfolgreich (bzw. Dry-Run abgeschlossen).
   1                Ungültiger Aufruf, ungeeignete Umgebung (kein Fedora,
                    Start als root) oder Teilfehler (von DNF übersprungene
-                   Pakete, nach kritischen Befunden nicht ausgeführtes
-                   DNF-Update, Flatpak/Snap/Firmware).
+                   Pakete, fehlgeschlagenes oder nach kritischen Befunden
+                   nicht ausgeführtes DNF-Update, Flatpak/Snap/Firmware).
   sonstige         Abbruch durch einen fehlgeschlagenen Befehl.
 EOF
 }
@@ -110,6 +114,14 @@ while [[ "$#" -gt 0 ]]; do
         -h|--help)
             print_usage
             exit 0
+            ;;
+        --exclude)
+            if [[ "$#" -lt 2 || -z "$2" ]]; then
+                error "Fehlendes Argument für --exclude <Muster>"
+                exit 1
+            fi
+            DNF_EXCLUDE_OPTS+=("--exclude=$2")
+            shift
             ;;
         --log)
             if [[ "$#" -lt 2 ]]; then
@@ -234,6 +246,9 @@ strip_ansi() {
     done
 }
 
+# Paketname aus "name-version-release.arch" (die Architektur hängt am Release)
+pkg_name() { local n=${1%-*}; printf '%s' "${n%-*}"; }
+
 DNF_SKIPPED=()
 DNF_BLOCKERS=()
 collect_dnf_skipped() {
@@ -244,9 +259,6 @@ collect_dnf_skipped() {
     local repo_re='(Paket|package) ([^[:space:]]+) (aus|from) ([^[:space:]]+) (benötigt|requires) '
     local header_re='(übersprungen|[Ss]kipping[^:]*):[[:space:]]*$'
     local row_re='^[[:space:]]+([^[:space:]]+)[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+'
-
-    # Paketname aus "name-version-release.arch" (die Architektur hängt am Release)
-    pkg_name() { local n=${1%-*}; printf '%s' "${n%-*}"; }
 
     while IFS= read -r line || [[ -n "$line" ]]; do
         strip_ansi line
@@ -320,6 +332,55 @@ collect_dnf_section_packages() {
     done < "$file"
 }
 
+# Erklärt ein fehlgeschlagenes 'dnf upgrade' anhand seiner Ausgabe. Erkannt werden Dateikonflikte der RPM-Transaktion
+# (dnf5 deutsch/englisch: "Datei X aus der Installation von A kollidiert mit der Datei aus dem Paket B" bzw.
+# "file X from install of A conflicts with file from package B"; dnf4 englisch ebenso). Haben A und B denselben Namen,
+# aber verschiedene Architektur und Version, liegt ein Multilib-Versatz vor: Der Spiegelserver bietet z.B. die
+# i686-Pakete schon neuer an als die x86_64-Pakete; beide Architekturen müssen aber dieselbe Version haben.
+# Entfernt wird dabei nichts, das Skript nennt nur einen Ausweg. Aufruf: explain_dnf_failure <Datei> <Exit-Code>
+explain_dnf_failure() {
+    local file=$1 rc=$2 line new old new_name old_name new_arch old_arch pattern example=""
+    local multilib="true"
+    local -a names=() patterns=()
+    local -A seen=() pattern_seen=()
+    local conflict_re='(aus der Installation von|from install of) ([^[:space:]]+) (kollidiert mit der Datei aus dem Paket|conflicts with file from package) ([^[:space:]]+)'
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        strip_ansi line
+        [[ "$line" =~ $conflict_re ]] || continue
+        new=${BASH_REMATCH[2]} old=${BASH_REMATCH[4]}
+        new_name=$(pkg_name "$new") old_name=$(pkg_name "$old")
+        new_arch=${new##*.} old_arch=${old##*.}
+        if [[ "$new_name" != "$old_name" || "$new_arch" == "$old_arch" || "${new%.*}" == "${old%.*}" ]]; then
+            multilib="false"
+        fi
+        if [[ -z "${seen[$new_name]:-}" ]]; then
+            seen[$new_name]=1
+            names+=("$new_name")
+            [[ -n "$example" ]] || example="$new_name: neu ${new#"$new_name"-}, installiert ${old#"$old_name"-}"
+        fi
+        # Muster für --exclude: der Namensanfang, damit alle Unterpakete derselben Quelle mitgenommen werden
+        pattern="${new_name%%-*}*"
+        [[ -n "${pattern_seen[$pattern]:-}" ]] || { pattern_seen[$pattern]=1; patterns+=("$pattern"); }
+    done < "$file"
+
+    if [[ ${#names[@]} -eq 0 ]]; then
+        warning "Das DNF-Update ist fehlgeschlagen (Code $rc). Details stehen oben in der DNF-Ausgabe."
+        return 0
+    fi
+    local exclude
+    exclude=$(IFS=,; printf '%s' "${patterns[*]}")
+    if [[ "$multilib" == "true" ]]; then
+        warning "Das DNF-Update ist an Dateikonflikten zwischen 32- und 64-Bit-Paketen gescheitert: $(join_list "${names[@]}"). DNF hat deshalb nichts installiert."
+        printf '%b  Ursache: Der Spiegelserver bietet diese Pakete für eine Architektur schon in einer neueren Version an als für die andere (z.B. %s). Beide Architekturen müssen dieselbe Version haben; das ist ein vorübergehendes Problem der Paketquelle, nicht des Systems.%b\n' \
+            "$YELLOW" "$example" "$RESET"
+    else
+        warning "Das DNF-Update ist an Dateikonflikten zwischen Paketen gescheitert: $(join_list "${names[@]}"). DNF hat deshalb nichts installiert."
+        printf '%b  Ursache: Zwei Pakete enthalten dieselben Dateien, meist ein Fehler der Paketquelle (oft einer Fremdquelle). Details stehen oben in der DNF-Ausgabe.%b\n' "$YELLOW" "$RESET"
+    fi
+    printf '%b  Abhilfe: in einigen Stunden erneut starten (die Vorabprüfung lädt die Paketquellen neu), oder die betroffenen Pakete vorerst auslassen: %s --exclude '"'"'%s'"'"'%b\n' \
+        "$YELLOW" "${0##*/}" "$exclude" "$RESET"
+}
+
 # Prüft, ob ein Paketname zu einem Muster aus CRITICAL_PACKAGES passt
 is_critical_package() {
     local pattern
@@ -339,7 +400,7 @@ dnf_preflight() {
     local rc=0 name preview
     local -a critical_skipped=() removed=() downgraded=()
     DNF_PREVIEW_FILE=$(mktemp)
-    run_step sudo env LC_ALL=C dnf upgrade --refresh --assumeno "${DNF_COLOR_OPTS[@]}" > "$DNF_PREVIEW_FILE" 2>&1 || rc=$?
+    run_step sudo env LC_ALL=C dnf upgrade --refresh --assumeno "${DNF_EXCLUDE_OPTS[@]}" "${DNF_COLOR_OPTS[@]}" > "$DNF_PREVIEW_FILE" 2>&1 || rc=$?
     [[ "$DRY_RUN" == "true" ]] && cat "$DNF_PREVIEW_FILE"
 
     collect_dnf_skipped "$DNF_PREVIEW_FILE"
@@ -399,6 +460,7 @@ printf '\n'
 info "Prüfe die anstehende DNF-Transaktion (Vorabprüfung ohne Änderungen, lädt ggf. Paketquellen neu)..."
 dnf_preflight
 DNF_UPGRADE_SKIPPED="false"
+DNF_UPGRADE_RC=0
 if [[ ${#DNF_CRITICAL[@]} -gt 0 ]]; then
     # Die Vorschau von DNF zeigen, damit die Befunde nachvollziehbar sind
     cat "$DNF_PREVIEW_FILE"
@@ -415,18 +477,28 @@ DNF_BLOCKERS=()
 if [[ "$DNF_UPGRADE_SKIPPED" != "true" ]]; then
     printf '\n'
     info "Starte System-Updates via DNF..."
+    [[ ${#DNF_EXCLUDE_OPTS[@]} -eq 0 ]] || info "Ausgelassen (--exclude): $(join_list "${DNF_EXCLUDE_OPTS[@]#--exclude=}")"
     DNF_OUTPUT_FILE=$(mktemp)
     # Die Ausgabe wird zusätzlich gesammelt, um übersprungene Pakete am Ende zusammenzufassen.
     # '--refresh' entfällt, die Paketquellen hat die Vorabprüfung gerade geladen.
-    run_step sudo dnf upgrade -y "${DNF_COLOR_OPTS[@]}" 2>&1 | tee "$DNF_OUTPUT_FILE"
+    # Das '||' fängt einen Fehler von DNF ab: Ohne es meldete der ERR-Trap ihn doppelt (einmal aus der Pipeline-
+    # Subshell, einmal für die ganze Pipeline) und das Skript bräche ohne Erklärung ab. Stattdessen wird die
+    # Ursache am Ende erklärt (siehe explain_dnf_failure), und Flatpak & Co. laufen weiter.
+    DNF_UPGRADE_RC=0
+    run_step sudo dnf upgrade -y "${DNF_EXCLUDE_OPTS[@]}" "${DNF_COLOR_OPTS[@]}" 2>&1 | tee "$DNF_OUTPUT_FILE" || DNF_UPGRADE_RC=$?
     collect_dnf_skipped "$DNF_OUTPUT_FILE"
-    if [[ ${#DNF_SKIPPED[@]} -gt 0 ]]; then
+    if (( DNF_UPGRADE_RC != 0 )); then
+        error "Das DNF-Update ist fehlgeschlagen (Code $DNF_UPGRADE_RC). Die übrigen Schritte laufen weiter, die Erklärung folgt am Ende."
+        UPDATE_WARNINGS+=("DNF-Update fehlgeschlagen")
+    elif [[ ${#DNF_SKIPPED[@]} -gt 0 ]]; then
         UPDATE_WARNINGS+=("DNF-Konflikte")
     fi
 fi
 
 if [[ "$DNF_UPGRADE_SKIPPED" == "true" ]]; then
     info "DNF 'autoremove' entfällt, weil das DNF-Update nicht ausgeführt wurde."
+elif (( DNF_UPGRADE_RC != 0 )); then
+    info "DNF 'autoremove' entfällt, weil das DNF-Update fehlgeschlagen ist."
 elif [[ "$RUN_AUTOREMOVE" == "true" ]]; then
     printf '\n'
     info "Führe DNF Autoremove aus..."
@@ -744,7 +816,9 @@ if [[ "$DNF_UPGRADE_SKIPPED" == "true" ]]; then
     warning "Das DNF-Update wurde wegen kritischer Befunde der Vorabprüfung nicht ausgeführt. Details stehen oben."
 fi
 
-if [[ ${#DNF_SKIPPED[@]} -gt 0 ]]; then
+if (( DNF_UPGRADE_RC != 0 )); then
+    explain_dnf_failure "$DNF_OUTPUT_FILE" "$DNF_UPGRADE_RC"
+elif [[ ${#DNF_SKIPPED[@]} -gt 0 ]]; then
     warning "DNF hat Updates wegen Abhängigkeitskonflikten übersprungen: $(join_list "${DNF_SKIPPED[@]}")."
     if [[ ${#DNF_BLOCKERS[@]} -gt 0 ]]; then
         printf '%b  Ursache: Diese installierten Pakete setzen noch die alten Versionen voraus: %s. Abhilfe: auf ein passendes Update dieser Pakete warten oder sie entfernen. Details stehen oben in der DNF-Ausgabe.%b\n' \

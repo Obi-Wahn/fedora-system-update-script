@@ -32,7 +32,8 @@ setup() {
     mock sudo '[[ "$1" == -v || "$1" == -n ]] && exit 0; exec "$@"'
     mock dnf 'if [[ "$1" == needs-restarting ]]; then echo "${MOCK_NEEDS_RESTARTING_OUTPUT:-}"; exit "${MOCK_NEEDS_RESTARTING_RC:-0}"; fi
 if [[ "$1" == upgrade && " $* " == *" --assumeno "* ]]; then [[ -n "${MOCK_DNF_PREVIEW_OUTPUT:-}" ]] && cat "$MOCK_DNF_PREVIEW_OUTPUT"; exit "${MOCK_DNF_PREVIEW_RC:-0}"; fi
-[[ "$1" == upgrade && -n "${MOCK_DNF_UPGRADE_OUTPUT:-}" ]] && cat "$MOCK_DNF_UPGRADE_OUTPUT"; exit 0'
+if [[ "$1" == upgrade ]]; then [[ -n "${MOCK_DNF_UPGRADE_OUTPUT:-}" ]] && cat "$MOCK_DNF_UPGRADE_OUTPUT"; exit "${MOCK_DNF_UPGRADE_RC:-0}"; fi
+exit 0'
     mock rpm '[[ -n "${MOCK_KERNEL:-}" ]] || exit 1; [[ "$*" == *--queryformat* ]] && echo "$MOCK_KERNEL"; exit 0'
 }
 
@@ -316,6 +317,90 @@ Aktualisiere 2/2 …  ███████████████████�
 Info: runtime org.example.Platform branch 1.0 is end-of-life, with reason:
 OUT
 fi'
+}
+
+# Gekürzte echte Ausgabe von dnf5 (Fedora 45): Der Spiegelserver hatte pipewire/nss für i686 schon in der neuen
+# Version, für x86_64 noch nicht. RPM bricht die Transaktion wegen Dateikonflikten ab, dnf endet mit Code 1.
+write_dnf_multilib_conflict_output() {
+    export MOCK_DNF_UPGRADE_OUTPUT="$BATS_TEST_TMPDIR/dnf-upgrade.txt"
+    export MOCK_DNF_UPGRADE_RC=1
+    cat > "$MOCK_DNF_UPGRADE_OUTPUT" <<'EOF'
+[22/22] Gesamt                          100% |   0.0   B/s |   0.0   B |  00m00s
+Transaktion wird ausgeführt
+Transaktion fehlgeschlagen: RPM-Transaktion fehlgeschlagen.
+  - Datei /usr/share/man/man5/pipewire-client.conf.5.gz aus der Installation von pipewire-libs-1.6.12-1.fc45.i686 kollidiert mit der Datei aus dem Paket pipewire-libs-1.6.11-1.fc45.x86_64
+  - Datei /usr/share/pipewire/client.conf aus der Installation von pipewire-libs-1.6.12-1.fc45.i686 kollidiert mit der Datei aus dem Paket pipewire-libs-1.6.11-1.fc45.x86_64
+  - Datei /usr/share/man/man5/cert9.db.5.gz aus der Installation von nss-3.134.0-1.fc45.i686 kollidiert mit der Datei aus dem Paket nss-3.133.0-1.fc45.x86_64
+  - Datei /usr/share/doc/pipewire/NEWS aus der Installation von pipewire-1.6.12-1.fc45.i686 kollidiert mit der Datei aus dem Paket pipewire-1.6.11-1.fc45.x86_64
+EOF
+}
+
+@test "fehlgeschlagenes DNF-Update wird genau einmal gemeldet, die übrigen Schritte laufen weiter" {
+    write_dnf_multilib_conflict_output
+    mock flatpak
+    run_script --autoremove
+    [ "$status" -eq 1 ]
+    # Kein (doppelter) Abbruch über den ERR-Trap
+    [[ "$output" != *"Fehler in Zeile"* ]]
+    [[ "$output" != *"Update abgebrochen"* ]]
+    [ "$(grep -c "Das DNF-Update ist fehlgeschlagen (Code 1)" <<< "$output")" -eq 1 ]
+    [[ "$output" == *"Update mit Teilfehlern abgeschlossen (DNF-Update fehlgeschlagen)"* ]]
+    [[ "$output" == *"DNF 'autoremove' entfällt, weil das DNF-Update fehlgeschlagen ist."* ]]
+    not_called "sudo dnf autoremove"
+    called "flatpak update --system -y"
+    # Die DNF-Ausgabe selbst bleibt sichtbar
+    [[ "$output" == *"RPM-Transaktion fehlgeschlagen"* ]]
+}
+
+@test "Dateikonflikt durch Multilib-Versatz wird erklärt und nennt einen Ausweg mit --exclude" {
+    write_dnf_multilib_conflict_output
+    run_script
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Dateikonflikten zwischen 32- und 64-Bit-Paketen gescheitert: pipewire-libs, nss, pipewire. DNF hat deshalb nichts installiert."* ]]
+    [[ "$output" == *"(z.B. pipewire-libs: neu 1.6.12-1.fc45.i686, installiert 1.6.11-1.fc45.x86_64)"* ]]
+    [[ "$output" == *"vorübergehendes Problem der Paketquelle"* ]]
+    [[ "$output" == *"update-system.sh --exclude 'pipewire*,nss*'"* ]]
+    # Es wird nichts entfernt
+    not_called "remove"
+}
+
+@test "englische Dateikonflikt-Meldung ohne Multilib-Bezug wird allgemein erklärt" {
+    export MOCK_DNF_UPGRADE_OUTPUT="$BATS_TEST_TMPDIR/dnf-upgrade.txt"
+    export MOCK_DNF_UPGRADE_RC=1
+    cat > "$MOCK_DNF_UPGRADE_OUTPUT" <<'EOF'
+Transaction failed: Rpm transaction failed.
+  - file /usr/bin/foo from install of foo-tools-2.0-1.fc45.x86_64 conflicts with file from package bar-1.0-1.fc45.x86_64
+EOF
+    run_script
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Dateikonflikten zwischen Paketen gescheitert: foo-tools."* ]]
+    [[ "$output" != *"32- und 64-Bit"* ]]
+    [[ "$output" == *"--exclude 'foo*'"* ]]
+}
+
+@test "anderer DNF-Fehler verweist auf die DNF-Ausgabe" {
+    export MOCK_DNF_UPGRADE_OUTPUT="$BATS_TEST_TMPDIR/dnf-upgrade.txt"
+    export MOCK_DNF_UPGRADE_RC=1
+    echo "Error: Something went wrong" > "$MOCK_DNF_UPGRADE_OUTPUT"
+    run_script
+    [ "$status" -eq 1 ]
+    [[ "$output" != *"Fehler in Zeile"* ]]
+    [[ "$output" == *"Details stehen oben in der DNF-Ausgabe."* ]]
+    [[ "$output" != *"Dateikonflikt"* ]]
+}
+
+@test "--exclude wird an Vorabprüfung und DNF-Update weitergegeben" {
+    run_script --exclude 'pipewire*,nss*' --exclude foo
+    [ "$status" -eq 0 ]
+    called "sudo env LC_ALL=C dnf upgrade --refresh --assumeno --exclude=pipewire*,nss* --exclude=foo"
+    called "sudo dnf upgrade -y --exclude=pipewire*,nss* --exclude=foo"
+    [[ "$output" == *"Ausgelassen (--exclude): pipewire*,nss*, foo"* ]]
+}
+
+@test "--exclude ohne Muster endet mit 1" {
+    run_script --exclude
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Fehlendes Argument für --exclude"* ]]
 }
 
 # Startet das Skript in einem Pseudo-Terminal mit der angegebenen Spaltenzahl.
